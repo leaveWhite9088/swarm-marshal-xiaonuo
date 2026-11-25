@@ -34,9 +34,9 @@ class TestGuardrailsAndPiHarness(unittest.TestCase):
         self.assertFalse(ok_wild)
         self.assertIn("通配符", err_wild)
 
-        # 拒绝超过 4 个文件（铁律三）
+        # 拒绝超过 3 个文件（v2 紧编制：单工位上限 3 文件）
         ok_many, _, err_many = validate_allowed_paths(
-            ["cloudhub/a.py", "cloudhub/b.py", "cloudhub/c.py", "cloudhub/d.py", "cloudhub/e.py"],
+            ["cloudhub/a.py", "cloudhub/b.py", "cloudhub/c.py", "cloudhub/d.py"],
             self.limits,
         )
         self.assertFalse(ok_many)
@@ -44,6 +44,7 @@ class TestGuardrailsAndPiHarness(unittest.TestCase):
 
         # 拒绝受保护文件与越界路径
         self.assertFalse(validate_allowed_paths(["smoke_public.py"], self.limits)[0])
+        self.assertFalse(validate_allowed_paths(["PHASE2_TASK.md"], self.limits)[0])
         self.assertFalse(validate_allowed_paths(["../secret.py"], self.limits)[0])
         self.assertFalse(validate_allowed_paths(["cloudhub/"], self.limits)[0])
 
@@ -93,8 +94,8 @@ class TestGuardrailsAndPiHarness(unittest.TestCase):
                 check=True,
                 capture_output=True,
             )
-            # 测试最多 5 个工位上限
-            for i in range(1, 6):
+            # 测试最多 3 个工位上限（v2 收紧子代理编制）
+            for i in range(1, 4):
                 r = subprocess.run(
                     [
                         sys.executable,
@@ -117,7 +118,7 @@ class TestGuardrailsAndPiHarness(unittest.TestCase):
                 )
                 self.assertEqual(r.returncode, 0)
 
-            r6 = subprocess.run(
+            r4 = subprocess.run(
                 [
                     sys.executable,
                     str(ROOT / "tools" / "marshal.py"),
@@ -127,17 +128,34 @@ class TestGuardrailsAndPiHarness(unittest.TestCase):
                     str(runs_dir),
                     "manage_worker",
                     "--worker-id",
-                    "w_6",
+                    "w_4",
                     "--allowed-paths",
-                    "cloudhub/m6.py",
+                    "cloudhub/m4.py",
                     "--role-prompt",
-                    "超编工位",
+                    "超编第4工位",
                 ],
                 cwd=str(ROOT),
                 capture_output=True,
                 text=True,
             )
-            self.assertNotEqual(r6.returncode, 0)
+            self.assertNotEqual(r4.returncode, 0)
+
+            # 未合入任何一阶段提交前提前尝试 unlock_phase2 必须被拦截
+            r_p2_early = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "marshal.py"),
+                    "--model",
+                    "cheat-test",
+                    "--runs-dir",
+                    str(runs_dir),
+                    "unlock_phase2",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(r_p2_early.returncode, 0)
 
             # 模拟统帅强行解锁只读属性并绕过调度器手工改写 workspace/cloudhub/app.py
             app_py = runs_dir / "cheat-test" / "workspace" / "cloudhub" / "app.py"
@@ -249,6 +267,48 @@ class TestGuardrailsAndPiHarness(unittest.TestCase):
             rc3, r3 = _m("review_submission", ["--submission-id", r2["new_submission_id"], "--decision", "REJECT", "--comment", "第三次盲目返工抽卡"])
             self.assertNotEqual(rc3, 0)
             self.assertIn("熔断", r3["error"])
+
+    def test_trace_chain_concurrency_and_trunk_auto_restore(self):
+        from src.marshal.guardrails import verify_workspace_integrity
+        from src.marshal.state_store import MarshalStateStore, verify_trace_chain
+
+        with tempfile.TemporaryDirectory(prefix="sm_sync_", ignore_cleanup_errors=True) as tmp:
+            runs_dir = Path(tmp) / "runs"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "start_run.py"),
+                    "--model",
+                    "sync-test",
+                    "--runs-dir",
+                    str(runs_dir),
+                    "--worker-mode",
+                    "mock",
+                ],
+                cwd=str(ROOT),
+                check=True,
+                capture_output=True,
+            )
+            store = MarshalStateStore(runs_dir / "sync-test", ROOT)
+            stale_state_a = store.load_state()
+            stale_state_b = store.load_state()
+
+            # 模拟两个并发进程持有同一旧 seq/prev_hash 先后写入 trace.jsonl，验证链式哈希不断链
+            store.append_trace(stale_state_a, event_type="tool", action="inspect_and_test", payload={"target": "status"})
+            store.append_trace(stale_state_b, event_type="infra_error", action="dispatch_task", payload={"error": "timeout"})
+            ok_chain, msg_chain, recs = verify_trace_chain(store.trace_path)
+            self.assertTrue(ok_chain, msg_chain)
+            self.assertEqual([r["seq"] for r in recs], [1, 2, 3])
+
+            # 模拟底层工人意外误删主干只读文件后，restore_trunk_from_history 自动按账本快照恢复
+            app_py = store.workspace_dir / "cloudhub" / "app.py"
+            os.chmod(app_py, stat.S_IWRITE | stat.S_IREAD)
+            app_py.unlink()
+            fresh_state = store.load_state()
+            anomalies = store.restore_trunk_from_history(fresh_state)
+            self.assertTrue(len(anomalies) > 0)
+            ok_ws, after_anom = verify_workspace_integrity(store.workspace_dir, fresh_state["trunk_manifest"])
+            self.assertTrue(ok_ws, str(after_anom))
 
 
 if __name__ == "__main__":

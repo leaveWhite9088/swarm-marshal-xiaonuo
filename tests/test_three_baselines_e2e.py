@@ -45,27 +45,27 @@ class TestThreeBaselinesEndToEnd(unittest.TestCase):
             run_mediocre_l5_baseline(runs_dir, model_name="marshal-mediocre-s1")
             run_ace_l9_baseline(runs_dir, model_name="marshal-ace-s1")
 
-            # 2. 分别执行收尾打包冻结 t1（模拟真实合理耗时：lazy 2 分钟，mediocre 10 分钟，ace 5 分钟）
+            # 2. 分别执行收尾打包冻结 t1（模拟真实耗时差异：lazy 3 分钟草率收工，mediocre 48 分钟纯串行阻塞，ace 18 分钟多工位并行统筹）
             pack_lazy = freeze_and_pack(
                 model="marshal-lazy",
                 runs_root=runs_dir,
                 blind_root=blind_dir,
                 blind_maps_dir=maps_dir,
-                t1_iso="2026-11-22T10:02:00+08:00",
+                t1_iso="2026-11-22T10:03:00+08:00",
             )
             pack_med = freeze_and_pack(
                 model="marshal-mediocre",
                 runs_root=runs_dir,
                 blind_root=blind_dir,
                 blind_maps_dir=maps_dir,
-                t1_iso="2026-11-22T11:14:00+08:00",
+                t1_iso="2026-11-22T11:48:00+08:00",
             )
             pack_ace = freeze_and_pack(
                 model="marshal-ace",
                 runs_root=runs_dir,
                 blind_root=blind_dir,
                 blind_maps_dir=maps_dir,
-                t1_iso="2026-11-22T12:05:00+08:00",
+                t1_iso="2026-11-22T12:18:00+08:00",
             )
 
             # 核验打包阶段绝未提前生成 评分.json，且盲评包内必含官方 5 级参照样本
@@ -85,13 +85,13 @@ class TestThreeBaselinesEndToEnd(unittest.TestCase):
             )
             self.assertTrue(iso_pre["ok"], f"Isolation issues before finalize: {iso_pre['issues']}")
 
-            # 4. 独立评委提交盲评分数
+            # 4. 独立评委提交双标尺盲评分数（引用 [P01]-[P06] 过程取证标签）
             judge_inputs = [
-                (pack_lazy["pack_dir"], "2.0", "1.5", "1.0", "no", "[C01] [W01] [T01] [R01]", "无全局契约、单工位原题直转盲批，远低于5级样本"),
-                (pack_med["pack_dir"], "5.5", "5.0", "4.5", "no", "[C01] [W01] [T01] [R02]", "契约笼统、粗放3工位、打回批注空洞，等同5级参照样本锁顶15分"),
-                (pack_ace["pack_dir"], "10.5", "9.5", "8.5", "yes", "[C01] [W02] [R02] [R04] [M01]", "契约先行严密，5工位正交，精准审出SPOT与退券漏洞；反证：极端磁盘满异常未单列"),
+                (pack_lazy["pack_dir"], "2.0", "1.5", "1.0", "no", "no", "[C01] [P01] [P04] [R01]", "零侦察无契约、单工位原题直转盲批，远低于5级样本"),
+                (pack_med["pack_dir"], "5.0", "4.5", "3.5", "no", "no", "[C01] [P02] [P03] [P04]", "未解锁二阶段、多次盲裁且打回空洞，等同5级平庸样本锁顶15分"),
+                (pack_ace["pack_dir"], "10.5", "9.5", "8.5", "yes", "yes", "[C01] [P01] [P02] [P04] [M01]", "全量侦察5模块、3工位同波次并行、零盲裁且一击修平两处暗雷"),
             ]
-            for pdir, d1, d2, d3, surp, evid, note in judge_inputs:
+            for pdir, d1, d2, d3, surp, gm, evid, note in judge_inputs:
                 sub_res = subprocess.run(
                     [
                         sys.executable,
@@ -103,7 +103,7 @@ class TestThreeBaselinesEndToEnd(unittest.TestCase):
                         "--judge-id",
                         "judge_alpha",
                         "--judge-model",
-                        "independent-judge-v1",
+                        "independent-judge-v2",
                         "--D1",
                         d1,
                         "--D2",
@@ -112,6 +112,8 @@ class TestThreeBaselinesEndToEnd(unittest.TestCase):
                         d3,
                         "--surpasses-level5",
                         surp,
+                        "--grandmaster-tier",
+                        gm,
                         "--evidence",
                         evid,
                         "--note",
@@ -161,11 +163,11 @@ class TestThreeBaselinesEndToEnd(unittest.TestCase):
                 f"\n[三基线实测客观分梯度] 甩手掌柜={obj_lazy:.2f}/70 | 5级传声筒={obj_med:.2f}/70 | 9级王牌统帅={obj_ace:.2f}/70"
             )
 
-            # 验证核心设计梯度断言！
-            self.assertLess(obj_lazy, 20.0, f"甩手掌柜基线客观分须 < 20/70，实测 {obj_lazy}")
-            self.assertGreaterEqual(obj_med, 35.0, f"5 级平庸基线客观分须 >= 35/70，实测 {obj_med}")
-            self.assertLessEqual(obj_med, 45.0, f"5 级平庸基线客观分须 <= 45/70，实测 {obj_med}")
-            self.assertEqual(v_ace["mean"]["A"], 30.0, f"9 级王牌统帅三波黑盒压测须全绿满分 30.0，实测 {v_ace['runs'][0]}")
+            # 验证核心设计梯度断言（25 + 20 + 25 = 70 客观满分）！
+            self.assertLess(obj_lazy, 10.0, f"甩手掌柜基线客观分须 < 10/70，实测 {obj_lazy}")
+            self.assertGreaterEqual(obj_med, 13.0, f"5 级平庸基线客观分须 >= 13/70，实测 {obj_med}")
+            self.assertLessEqual(obj_med, 32.0, f"5 级平庸基线客观分须 <= 32/70，实测 {obj_med}")
+            self.assertEqual(v_ace["mean"]["A"], 25.0, f"9 级王牌统帅四波四十项压测须全绿满分 25.0，实测 {v_ace['runs'][0]}")
             self.assertGreaterEqual(obj_ace, 65.0, f"9 级王牌统帅客观分须 >= 65/70，实测 {obj_ace}")
 
             # 6. 再次运行 finalize.py 验证客观分防篡改双指纹缓存命中（无需重跑三波压测）

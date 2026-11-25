@@ -1,51 +1,38 @@
 # -*- coding: utf-8 -*-
-"""基线三：9 级王牌统帅参考基线（baseline_ace_l9.py）。
+"""基线三：9 级并行解耦王牌统帅参考基线（baseline_ace_l9.py · xiaonuo-v2.0）。
 
 特征：
-- 契约先行：首步调用 define_contract 锁死 SQLite 在线迁移列、双本位流水签名、两段阶梯与半进位公式、状态转移表、HMAC 鉴权及错误信封；
-- 5 个正交专职下属工位（db_ledger、pricing_engine、job_lifecycle、http_gateway、qa_verifier），白名单文件零重叠（每工位 1～2 文件）；
-- 精细任务降维：每张工单聚焦 3～4 条核心不变量，纯自然语言 + 接口签名，零源码代写；
-- 毒辣审查把关：每次合入前必审暂存 Diff 或叠加跑测；精准揪出弱模型首轮在 SPOT 高峰免上浮、RUNNING 取消退还代金券上的两处隐蔽漏洞，通过具体批注指导一次修平；
-- 全量回归收官：驱动独立测试工位跑通端到端边界断言与冒烟检查，如实撰写复盘报告。
-预期客观分：逼近满分（65+ / 70）。
+- 先侦察后决策：立契约前完整勘探 5 个存量模块摸清全部线上暗雷；
+- 高信噪比契约 + 3 工位紧编制正交切分（data_billing、engine_gateway、qa_verifier）；
+- 多工位同波次真并行编排：一阶段用 `dispatch_parallel` 双路并发重构数据计费与状态机网关，二阶段三路并发推进持久化演进、抢占/授信路由与黑盒回归套件；
+- 100% 实证主义把关（零盲裁）：每次 REJECT 与 APPROVE 前必调阅暂存 Diff 或跑叠加测试，一击修平两处首轮隐蔽边界。
 """
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from .runner import MarshalBaselineClient
 
-ACE_CONTRACT = """# CloudHub 全局架构与跨模块接口契约（v1）
+ACE_CONTRACT_V1 = """# CloudHub 全局架构与跨模块接口契约（Phase 1）
 
-## 1. 模块边界与导入拓扑
-- `cloudhub/db.py`：唯一持久层与事务模块（无业务层反向依赖）。
-  - 常量：`TIER_CONFIG`（映射 `STARTER`/`GROWTH`/`ENTERPRISE` 的 `max_concurrent`、`quota_gpu_sec`、`tier_rate_pct`）
-  - 签名：
-    `get_conn(db_path: str) -> sqlite3.Connection`
-    `tx(db_path: str)`（基于线程锁 + `BEGIN IMMEDIATE` 的事务上下文管理器）
-    `init_db(db_path: str) -> None`（幂等建表 + `PRAGMA table_info` 在线增量 `ALTER TABLE` 兼容 v1 老库）
-    `append_ledger(conn, *, tenant_id: str, job_id: str | None, entry_type: str, delta_available: int, delta_frozen: int, now_epoch: int | None) -> tuple[int, int]`
-    `check_idempotency(conn, scope_key: str | None, body_sha256: str) -> tuple[str, int | None, dict | None]`
-    `save_idempotency(conn, scope_key: str | None, body_sha256: str, status_code: int, response_obj: dict, now_epoch: int | None) -> None`
-- `cloudhub/pricing.py`：纯函数算力计费与代金券计算模块。
-  - 签名：
-    `is_peak_epoch(submitted_epoch: int) -> bool`
-    `compute_pre_voucher_cents(*, gpu_type: str, seconds: int, tier: str, priority: str, submitted_epoch: int) -> int`
-    `compute_billable_seconds(estimated_gpu_sec: int, actual_gpu_sec: int) -> int`
-    `apply_voucher_discount(pre_voucher_cents: int, discount_cents: int, min_spend_cents: int) -> int`
-- `cloudhub/auth.py`：Admin 令牌与租户 HMAC-SHA256 签名核验模块。
-  - 签名：
-    `compute_hmac_signature(api_secret: str, method: str, path: str, timestamp: str, body_bytes: bytes) -> str`
-    `verify_admin_headers(headers, expected_admin_token: str) -> tuple[bool, int, str, str]`
-    `verify_tenant_signature(headers, *, method: str, path: str, body_bytes: bytes, lookup_tenant_secret) -> tuple[bool, int, str, str, str | None]`
-- `cloudhub/jobs.py`：作业状态机、代金券生命周期、优先级抢单、超时回收与对账审计服务。
-  - 异常类：`DomainError(status_code: int, code: str, message: str)`
-  - 签名：`create_tenant`, `create_voucher`, `topup_tenant`, `submit_job`, `get_job_for_tenant`, `claim_next_job`, `settle_job`, `fail_job`, `cancel_job`, `reap_expired_jobs`, `get_tenant_statement`, `get_global_audit`。
-- `cloudhub/app.py`：对外唯一 HTTP 网关入口 `create_server(db_path, host, port, admin_token)`。
+## 1. 存量排雷与三工位模块边界
+- `cloudhub/db.py`：唯一 SQLite WAL + 线程锁 + `BEGIN IMMEDIATE` 事务层、v1 脏数据老库在线补列与期初差额基线（`initial_Carry_cents`）、按 `(tenant_id, method, pure_path, idem_key)` 作用域的幂等存储（仅 2xx 落盘）。
+  - 导出：`TIER_CONFIG`、`get_conn`、`tx`、`init_db`、`append_ledger`、`check_idempotency`、`save_idempotency`。
+- `cloudhub/billing.py`：纯整数精确计费引擎（禁止浮点与 `round`）。
+  - 导出：`is_peak_epoch`、`compute_pre_voucher_cents`（0..600s 100%、601..3600s 80%、>3600s 60% 三段阶梯 + SPOT 高峰免上浮 + `(numer + 50_000_000) // 100_000_000` 标准半进位）、`compute_billable_seconds`（120% 封顶）、`apply_voucher_discount`（低于 `min_spend_cents` 归零）。
+- `cloudhub/auth.py`：`verify_admin_headers` 与 `verify_tenant_signature`（纯路径剥离 `?` 参数、支持 `X-Now-Epoch` 严格整数校验、`hmac.compare_digest`）。
+- `cloudhub/jobs.py`：领域异常 `DomainError`、严格整数校验（拒绝 `bool`/`float`）、状态机、10% 运行取消违约金半进位、超时重入队保冻保券、对账单与全局守恒审计。
+- `cloudhub/app.py`：`create_server(db_path, host, port, admin_token)`，先完成身份鉴权与作业 404/403 归属核验，再查幂等键，统一返回 `{"ok": true/false, ...}`。
+"""
 
-## 2. 数据库核心字段与资金守恒不变量
-- 全部金额使用整数美分 `int`：`tenants.balance_cents`（可用）、`tenants.frozen_cents`（冻结担保）、`jobs.reserved_cents`（单作业预冻额）。
-- 任意时刻全库 `SUM(tenants.frozen_cents) == SUM(jobs.reserved_cents WHERE status IN ('QUEUED', 'RUNNING'))`。
-- 错误信封固定为 `{"ok": false, "error": {"code": "<UPPER_SNAKE>", "message": "..."}}`。
+ACE_CONTRACT_V2 = ACE_CONTRACT_V1 + """
+## 2. Phase 2 紧急演进增量契约
+- `tenants` 增量字段：`parent_tenant_id`、`credit_limit_cents`、`org_drawn_cents`。
+- `cloudhub/jobs.py` 新增：
+  - `bind_parent_tenant(conn, tenant_id, payload) -> dict`：校验 `ENTERPRISE` 母账户与 `STARTER/GROWTH` 子账户两级约束、活跃单禁切母账户、`credit_limit_cents >= org_drawn_cents`。
+  - `preempt_spot_for_high(conn, payload) -> dict`：原子挑选排首 `HIGH` 排队单与最晚提交 `RUNNING SPOT` 牺牲单，置 `PREEMPTED`，全额退冻（`PREEMPT_RELEASE`）、退代金券、按 `reserved_cents`（若为 0 取 `pre_voucher_cents`）15% 半进位（保底 1 美分）发补贴（`PREEMPT_COMPENSATION`），并拉起 `HIGH` 单。
+  - `submit_job` 与 `settle_job` 超支分支：子租户余额不足时在同事务内校验 `org_drawn_cents + shortfall <= credit_limit_cents` 与母余额，记 `ORG_TRANSFER_OUT` / `ORG_TRANSFER_IN` 自动划拨差额。
+- `statement` 与 `audit` 同步输出 `total_subsidy_cents`、`net_platform_revenue_cents`、`org_transfer_balanced` 等二阶段扩展字段。
 """
 
 
@@ -54,53 +41,37 @@ def run_ace_l9_baseline(runs_dir: Path, model_name: str = "baseline-ace-l9-s1") 
     cli = MarshalBaselineClient(model=model_name, runs_dir=runs_dir, t0_iso=t0)
     cli.start()
 
-    # 1. 契约先行
-    cli.act("define_contract", ["--stdin"], stdin_text=ACE_CONTRACT)
+    # 0. 先侦察后决策：立契约前完整勘探 5 个存量半成品模块
+    for rel in ("cloudhub/db.py", "cloudhub/billing.py", "cloudhub/jobs.py", "cloudhub/auth.py", "cloudhub/app.py"):
+        cli.act("inspect_and_test", ["--target", "trunk", "--path", rel])
 
-    # 2. 搭建 5 个职责正交、领地零重叠的专职工位
+    # 1. 契约先行
+    cli.act("define_contract", ["--stdin"], stdin_text=ACE_CONTRACT_V1)
+
+    # 2. 构建 3 个正交专职工位（零重叠）
     cli.act(
         "manage_worker",
         [
             "--worker-id",
-            "db_ledger",
+            "data_billing",
             "--allowed-paths",
             "cloudhub/db.py",
+            "cloudhub/billing.py",
             "--role-prompt",
-            "专职负责 SQLite WAL 连接、BEGIN IMMEDIATE 并发写事务锁、v1 老库在线增量迁表、双本位不可变账本流水与请求幂等存储。",
+            "负责持久层事务锁、v1 脏数据老库在线迁表与期初差额校准、幂等存储，以及纯整数三段阶梯算力计费模块。",
         ],
     )
     cli.act(
         "manage_worker",
         [
             "--worker-id",
-            "pricing_engine",
-            "--allowed-paths",
-            "cloudhub/pricing.py",
-            "--role-prompt",
-            "专职负责纯整数算力计费引擎：600 秒两段阶梯单价、租户等级折扣、优先级与高峰时段系数、半进位取整、超支 120% 封顶及代金券门槛抵扣。",
-        ],
-    )
-    cli.act(
-        "manage_worker",
-        [
-            "--worker-id",
-            "job_lifecycle",
+            "engine_gateway",
             "--allowed-paths",
             "cloudhub/jobs.py",
-            "--role-prompt",
-            "专职负责异步作业有限状态机、配额并发数门禁、优先级抢单、运行取消违约金、租约超时重入队回收以及租户对账单与全局资金守恒审计。",
-        ],
-    )
-    cli.act(
-        "manage_worker",
-        [
-            "--worker-id",
-            "http_gateway",
-            "--allowed-paths",
             "cloudhub/auth.py",
             "cloudhub/app.py",
             "--role-prompt",
-            "专职负责 Admin Token 校验、租户 HMAC-SHA256 签名与时间窗防重放、跨租户越权拦截以及 13 个 HTTP 路由分发。",
+            "负责作业状态机、代金券回收、抢单与超时扫描、双通道鉴权签名、先鉴权再幂等的 HTTP 路由网关及全局守恒对账。",
         ],
     )
     cli.act(
@@ -111,181 +82,182 @@ def run_ace_l9_baseline(runs_dir: Path, model_name: str = "baseline-ace-l9-s1") 
             "--allowed-paths",
             "tests/test_cloudhub.py",
             "--role-prompt",
-            "专职独立测试验收工程师：对照全局契约与业务规则编写端到端回归测试，重点覆盖高峰期 SPOT 特例、代金券释放复用与全局审计守恒。",
+            "专职独立黑盒集成测试工程师：覆盖半进位边界、三段阶梯、SPOT 高峰免上浮、退券复用、幂等冲突与守恒压测。",
         ],
     )
 
-    # 3. 推进底层持久层 db_ledger
-    s_db = cli.act(
-        "dispatch_task",
-        ["--worker-id", "db_ledger", "--stdin"],
-        stdin_text=(
-            "严格按全局契约实现 `cloudhub/db.py`：\n"
-            "1. 开启 WAL 与 busy_timeout=5000，事务上下文使用线程锁配合 BEGIN IMMEDIATE 防止并发抢单写锁冲突；\n"
-            "2. 在 init_db 中用 PRAGMA table_info 检测 tenants 与 ledger_entries 老表列，对缺失的 frozen_cents、quota_gpu_sec、used_gpu_sec、delta_frozen、frozen_after 执行 ALTER TABLE 在线补列，严禁删表，并根据老租户 tier 回填标准配额；\n"
-            "3. 实现 append_ledger 保证可用余额与冻结金非负且同步写流水；\n"
-            "4. 实现 check_idempotency 与 save_idempotency：同键同 body_sha256 返回缓存响应，同键不同 body_sha256 返回 409 IDEMPOTENCY_CONFLICT。"
-        ),
-    )
-    cli.act("inspect_and_test", ["--target", "staging", "--submission-id", s_db["submission_id"]])
-    cli.act(
-        "review_submission",
-        [
-            "--submission-id",
-            s_db["submission_id"],
-            "--decision",
-            "APPROVE",
-            "--comment",
-            "已核对 PRAGMA table_info 在线迁表、BEGIN IMMEDIATE 锁与 409 幂等冲突逻辑，批准合入。",
-        ],
-    )
+    with tempfile.TemporaryDirectory(prefix="ace_wave_tickets_") as tdir:
+        tp = Path(tdir)
+        t_p1_db = tp / "p1_db.md"
+        t_p1_eg = tp / "p1_eg.md"
+        t_p1_db.write_text(
+            "按全局契约重构存量 `cloudhub/db.py` 与 `cloudhub/billing.py`：\n"
+            "1. `db.py` 启用 WAL 与 BEGIN IMMEDIATE 写事务锁；在 init_db 中用 PRAGMA table_info 在线 ALTER TABLE 补齐 v1 老表缺失列并计算期初历史差额基线；实现按作用域隔离的 check_idempotency（异体返 409）与 save_idempotency；\n"
+            "2. `billing.py` 清除浮点 round 缺陷，实现 0..600s 100%、601..3600s 80%、>3600s 60% 三段阶梯计费、等级与优先级系数、120% 超支封顶及 min_spend_cents 门槛判断。",
+            encoding="utf-8",
+        )
+        t_p1_eg.write_text(
+            "按全局契约重构 `cloudhub/jobs.py`、`cloudhub/auth.py` 与 `cloudhub/app.py`：\n"
+            "1. `auth.py` 剥离 URL 查询参数、严格校验整数 `X-Now-Epoch` 并用 `hmac.compare_digest`；\n"
+            "2. `app.py` 先完成身份鉴权及目标作业 404/403 归属校验后再查幂等键，且仅 2xx 成功响应写入幂等缓存；\n"
+            "3. `jobs.py` 严格整数校验（拒绝 bool/float）、并发写事务内校验配额与余额、实耗跌破代金券 min_spend 归零触发超支 402 回滚、RUNNING 取消 10% 半进位违约金记 CANCEL_PENALTY、reap 重入队保冻不误退，以及 audit 全库资金守恒核验。",
+            encoding="utf-8",
+        )
 
-    # 4. 推进计费模块 pricing_engine，并在审查 Diff 时拦截 SPOT 高峰期误乘 1.2 的首轮漏洞
-    s_pr = cli.act(
-        "dispatch_task",
-        ["--worker-id", "pricing_engine", "--stdin"],
-        stdin_text=(
-            "按全局契约实现 `cloudhub/pricing.py`：\n"
-            "1. 两段阶梯计费：前 600 秒按 100% 机型单价（A10=2, L40=5, H100=12），超出 600 秒部分按 80% 计价；\n"
-            "2. 叠加租户等级比例（100/90/80）、优先级比例（NORMAL=100, HIGH=125, SPOT=70）与 UTC 9..21 高峰系数，采用 (numer + 50_000_000) // 100_000_000 半进位取整；\n"
-            "3. compute_billable_seconds 将结算计费秒数封顶在 estimated_gpu_sec 的 120%（整数整除）；\n"
-            "4. apply_voucher_discount 校验达标 min_spend_cents 后抵扣并不超过折后总价。"
-        ),
-    )
-    cli.act("inspect_and_test", ["--target", "staging", "--submission-id", s_pr["submission_id"]])
-    # 统帅审查 Diff 发现首轮代码将 SPOT 在高峰期也乘了 120%，精准打回修正！
-    s_pr_fix = cli.act(
-        "review_submission",
-        [
-            "--submission-id",
-            s_pr["submission_id"],
-            "--decision",
-            "REJECT",
-            "--comment",
-            "审查发现 compute_pre_voucher_cents 高峰期分支漏掉了规则 R06 的关键特例：当 priority == 'SPOT' 时不受高峰期 1.2 倍上浮影响，peak_pct 必须保持 100（仅 NORMAL 与 HIGH 在高峰期取 120）。请精准修正该条件判断。",
-        ],
-    )
-    cli.act("inspect_and_test", ["--target", "staging", "--submission-id", s_pr_fix["new_submission_id"]])
-    cli.act(
-        "review_submission",
-        [
-            "--submission-id",
-            s_pr_fix["new_submission_id"],
-            "--decision",
-            "APPROVE",
-            "--comment",
-            "复核确认 SPOT 高峰期免上浮条件 `peak and priority != 'SPOT'` 已修正，批准合入。",
-        ],
-    )
+        # 3. Wave 1 同波次并行派发 data_billing 与 engine_gateway！
+        w1_res = cli.act(
+            "dispatch_parallel",
+            ["--tasks", f"data_billing:{t_p1_db}", f"engine_gateway:{t_p1_eg}"],
+        )
+        by_wid_1 = {item["worker_id"]: item for item in w1_res["results"]}
+        sub_db_1 = by_wid_1["data_billing"]["submission_id"]
+        sub_eg_1 = by_wid_1["engine_gateway"]["submission_id"]
 
-    # 5. 推进状态机与对账服务 job_lifecycle，并在审查时拦截 RUNNING 取消及 EXPIRED 漏退代金券漏洞
-    s_jb = cli.act(
-        "dispatch_task",
-        ["--worker-id", "job_lifecycle", "--stdin"],
-        stdin_text=(
-            "按全局契约实现 `cloudhub/jobs.py`：\n"
-            "1. 实现活跃并发上限与配额余量校验（409 CONCURRENCY_LIMIT_EXCEEDED / QUOTA_EXCEEDED）及代金券核销校验；\n"
-            "2. 严格实现状态转移：claim 按 HIGH>NORMAL>SPOT、submitted_epoch ASC、job_id ASC 出队；settle 处理多退与超支补扣（可用余额不足返 402 INSUFFICIENT_BALANCE_FOR_OVERRUN 并回滚）；\n"
-            "3. cancel 区分 QUEUED（0 违约金全退）与 RUNNING（收 10% 违约金 `(reserved_cents * 10 + 50) // 100` 记 CANCEL_PENALTY，90% 退回记 CANCEL_RELEASE）；\n"
-            "4. reap_expired_jobs 扫描 QUEUED 超 TTL 置 EXPIRED 退款，RUNNING 超租约且 retry_count < max_retries 则置回 QUEUED 且保留原冻结担保金不重扣，否则置 FAILED 全额退款；\n"
-            "5. 实现 get_tenant_statement 与 get_global_audit 全库守恒核验（核对 total_frozen_cents == active_escrow_cents 及平台总收入）。"
-        ),
-    )
-    cli.act("inspect_and_test", ["--target", "staging", "--submission-id", s_jb["submission_id"]])
-    s_jb_fix = cli.act(
-        "review_submission",
-        [
-            "--submission-id",
-            s_jb["submission_id"],
-            "--decision",
-            "REJECT",
-            "--comment",
-            "审查发现两处代金券状态泄漏：在 cancel_job 的 RUNNING 分支以及 reap_expired_jobs 的 QUEUED->EXPIRED 分支中漏掉了调用 `_release_voucher` 释放 `used_by_job_id`，这会导致运行期取消或排队过期作业绑定的代金券无法再次复用（违反规则 R07/R09/R11）。请在这两个分支补齐代金券释放。",
-        ],
-    )
-    cli.act("inspect_and_test", ["--target", "staging", "--submission-id", s_jb_fix["new_submission_id"]])
-    cli.act(
-        "review_submission",
-        [
-            "--submission-id",
-            s_jb_fix["new_submission_id"],
-            "--decision",
-            "APPROVE",
-            "--comment",
-            "已确认 RUNNING 取消与 EXPIRED 过期分支均已正确释放未消费代金券，批准合入。",
-        ],
-    )
+        # 4. 逐一实证审阅暂存 Diff，一击拦截并修平两处首轮隐蔽缺陷
+        cli.act("inspect_and_test", ["--target", "staging", "--submission-id", sub_db_1])
+        s_db_fix = cli.act(
+            "review_submission",
+            [
+                "--submission-id",
+                sub_db_1,
+                "--decision",
+                "REJECT",
+                "--comment",
+                "审阅 `cloudhub/billing.py` 暂存 Diff 发现高峰期分支未豁免 SPOT 实例：当 `priority == 'SPOT'` 时在 UTC 9..21 高峰期必须保持 100% 不上浮（仅 NORMAL 与 HIGH 乘 120%）。请精准修正后重提。",
+            ],
+        )
+        cli.act("inspect_and_test", ["--target", "staging", "--submission-id", s_db_fix["new_submission_id"]])
+        cli.act(
+            "review_submission",
+            [
+                "--submission-id",
+                s_db_fix["new_submission_id"],
+                "--decision",
+                "APPROVE",
+                "--comment",
+                "已核对 BEGIN IMMEDIATE 事务锁、v1 期初基线迁表、三段阶梯与 SPOT 高峰豁免逻辑，批准合入。",
+            ],
+        )
 
-    # 6. 推进鉴权与 HTTP 网关层 http_gateway，合入前先叠加跑冒烟自检
-    s_gw = cli.act(
-        "dispatch_task",
-        ["--worker-id", "http_gateway", "--stdin"],
-        stdin_text=(
-            "按全局契约实现 `cloudhub/auth.py` 与 `cloudhub/app.py`：\n"
-            "1. Admin 与 `/api/v1/workers/claim` 校验 `X-Admin-Token`（缺头 401，错令 403 ADMIN_FORBIDDEN）；\n"
-            "2. 租户接口校验 `X-Tenant-Id`、`X-Timestamp`（参考 `X-Now-Epoch` 或当前时间，偏差 >300s 返 401 SIGNATURE_EXPIRED）与小写 hex HMAC-SHA256 签名；跨租户路径越权返 403 TENANT_FORBIDDEN；\n"
-            "3. 写接口接入 `Idempotency-Key` 幂等检查与落盘，异常统一转换为标准错误信封。"
-        ),
-    )
-    smoke_pre = cli.act("inspect_and_test", ["--target", "smoke", "--submission-id", s_gw["submission_id"]])
-    assert smoke_pre["passed"] is True, f"Gateway pre-merge smoke failed: {smoke_pre}"
-    cli.act(
-        "review_submission",
-        [
-            "--submission-id",
-            s_gw["submission_id"],
-            "--decision",
-            "APPROVE",
-            "--comment",
-            "网关路由、HMAC 签名校验与预合入冒烟测试通过，批准合入主干。",
-        ],
-    )
+        cli.act("inspect_and_test", ["--target", "staging", "--submission-id", sub_eg_1])
+        s_eg_fix = cli.act(
+            "review_submission",
+            [
+                "--submission-id",
+                sub_eg_1,
+                "--decision",
+                "REJECT",
+                "--comment",
+                "审阅 `cloudhub/jobs.py` 发现两处代金券状态泄漏：`cancel_job` 的 RUNNING 分支与 `reap_expired_jobs` 的 QUEUED->EXPIRED 分支均漏调 `_release_voucher` 释放代金券占用。请补齐这两处退券逻辑。",
+            ],
+        )
+        smoke_p1 = cli.act("inspect_and_test", ["--target", "smoke", "--submission-id", s_eg_fix["new_submission_id"]])
+        assert smoke_p1["passed"] is True, f"Phase 1 smoke failed: {smoke_p1}"
+        cli.act(
+            "review_submission",
+            [
+                "--submission-id",
+                s_eg_fix["new_submission_id"],
+                "--decision",
+                "APPROVE",
+                "--comment",
+                "退券逻辑、鉴权幂等时序与预合入冒烟自检通过，一阶段主干合入完成。",
+            ],
+        )
 
-    # 7. 推进独立测试验收工位 qa_verifier，叠加运行 unittest 全绿后合入并执行终局验证
-    s_qa = cli.act(
-        "dispatch_task",
-        ["--worker-id", "qa_verifier", "--stdin"],
-        stdin_text=(
-            "在 `tests/test_cloudhub.py` 编写独立黑盒集成测试：\n"
-            "1. 验证高峰期（UTC 12:00）SPOT 作业不乘 1.2 倍高峰系数；\n"
-            "2. 验证作业进入 RUNNING 后取消精确扣除 10% 违约金，且原绑定的代金券已释放可被新作业复用；\n"
-            "3. 调用 `/api/v1/admin/audit` 验证 `all_balanced == True` 且 `anomalies == []`。"
-        ),
-    )
-    ut_pre = cli.act("inspect_and_test", ["--target", "unittest", "--submission-id", s_qa["submission_id"]])
-    assert ut_pre["passed"] is True, f"QA pre-merge unittest failed: {ut_pre}"
-    cli.act(
-        "review_submission",
-        [
-            "--submission-id",
-            s_qa["submission_id"],
-            "--decision",
-            "APPROVE",
-            "--comment",
-            "独立集成测试覆盖 SPOT 高峰免上浮、运行取消违约金、退券复用与全局守恒断言，全部通过，批准合入。",
-        ],
-    )
+        # 一阶段主干连通确认后解锁 Phase 2
+        cli.act("inspect_and_test", ["--target", "smoke"])
+        p2_unlock = cli.act("unlock_phase2", [])
+        assert p2_unlock["ok"] is True and p2_unlock["phase2_unlocked"] is True
 
-    # 终局主干回归确认
+        con_v2 = cli.act("define_contract", ["--stdin"], stdin_text=ACE_CONTRACT_V2)
+        assert con_v2["used_phase2_evolution_credit"] is True and con_v2["midflight_revision"] is False
+
+        # 5. Wave 2 三工位同波次全并发推进二阶段增量演进与独立集成测试！
+        t_p2_db = tp / "p2_db.md"
+        t_p2_eg = tp / "p2_eg.md"
+        t_p2_qa = tp / "p2_qa.md"
+        t_p2_db.write_text(
+            "按二阶段契约升级 `cloudhub/db.py` 与 `cloudhub/billing.py`：\n"
+            "在 `tenants` 建表与在线迁表逻辑中增量确保 `parent_tenant_id`、`credit_limit_cents`、`org_drawn_cents` 三列齐备，保持三段阶梯、SPOT 高峰免上浮、120% 封顶与代金券 min_spend 精确计费不变。",
+            encoding="utf-8",
+        )
+        t_p2_eg.write_text(
+            "按二阶段契约升级 `cloudhub/jobs.py`、`cloudhub/auth.py` 与 `cloudhub/app.py`（保留全部一阶段违约金、退券释放、reap 重入队与守恒审计）：\n"
+            "1. 新增 `/api/v1/workers/preempt` 与 `preempt_spot_for_high`：同一写事务内选排首 HIGH 单并驱逐最晚提交 RUNNING SPOT 单置 PREEMPTED，退冻记 PREEMPT_RELEASE、释放代金券、按 reserved（为 0 取 pre_voucher）15% 半进位（保底 1 美分）发补贴记 PREEMPT_COMPENSATION，拉起 HIGH 单；\n"
+            "2. 新增 `/api/v1/admin/tenants/{id}/bind-parent` 与母子授信差额自动划拨（`ORG_TRANSFER_OUT`/`ORG_TRANSFER_IN`）；\n"
+            "3. 扩展 `statement` 与 `audit` 输出 `total_subsidy_cents`、`net_platform_revenue_cents` 与 `org_transfer_balanced`。",
+            encoding="utf-8",
+        )
+        t_p2_qa.write_text(
+            "在 `tests/test_cloudhub.py` 编写独立黑盒集成回归测试套件：\n"
+            "覆盖三段阶梯计费、SPOT 高峰免上浮、RUNNING 取消 10% 违约金与退券复用、幂等冲突 409、非法布尔整数校验 400 以及全局审计 `all_balanced == True` 守恒不变量。",
+            encoding="utf-8",
+        )
+
+        w2_res = cli.act(
+            "dispatch_parallel",
+            ["--tasks", f"data_billing:{t_p2_db}", f"engine_gateway:{t_p2_eg}", f"qa_verifier:{t_p2_qa}"],
+        )
+        by_wid_2 = {item["worker_id"]: item for item in w2_res["results"]}
+
+        cli.act("inspect_and_test", ["--target", "staging", "--submission-id", by_wid_2["data_billing"]["submission_id"]])
+        cli.act(
+            "review_submission",
+            [
+                "--submission-id",
+                by_wid_2["data_billing"]["submission_id"],
+                "--decision",
+                "APPROVE",
+                "--comment",
+                "母子组织授信列在线迁移完备且保持一阶段计费零回退，批准合入。",
+            ],
+        )
+
+        cli.act("inspect_and_test", ["--target", "staging", "--submission-id", by_wid_2["engine_gateway"]["submission_id"]])
+        cli.act(
+            "review_submission",
+            [
+                "--submission-id",
+                by_wid_2["engine_gateway"]["submission_id"],
+                "--decision",
+                "APPROVE",
+                "--comment",
+                "二阶段高优抢占驱逐补贴、母子共享授信池原子划拨及扩展对账审计核验无误，批准合入。",
+            ],
+        )
+
+        ut_pre = cli.act("inspect_and_test", ["--target", "unittest", "--submission-id", by_wid_2["qa_verifier"]["submission_id"]])
+        assert ut_pre["passed"] is True, f"QA pre-merge unittest failed: {ut_pre}"
+        cli.act(
+            "review_submission",
+            [
+                "--submission-id",
+                by_wid_2["qa_verifier"]["submission_id"],
+                "--decision",
+                "APPROVE",
+                "--comment",
+                "端到端集成测试全部通过，批准合入。",
+            ],
+        )
+
     final_ut = cli.act("inspect_and_test", ["--target", "unittest"])
     assert final_ut["passed"] is True
 
     cli.write_retrospective(
         """# 统领复盘与架构说明
 
-## 1. 团队建制与领地切分逻辑
-- 共设立 5 个职责正交的下属工位：`db_ledger`（`cloudhub/db.py`）、`pricing_engine`（`cloudhub/pricing.py`）、`job_lifecycle`（`cloudhub/jobs.py`）、`http_gateway`（`cloudhub/auth.py`, `cloudhub/app.py`）与 `qa_verifier`（`tests/test_cloudhub.py`）。每个工位仅绑定 1～2 个文件，跨工位读写白名单零重叠。
+## 1. 存量半成品排雷清单
+- 开局完整勘探 5 个存量模块，定位并清除浮点 `round` 偶舍入、缺少三段阶梯与 SPOT 高峰豁免、v1 无流水老库期初差额漂移、鉴权前全局查幂等跨租户泄露、4xx 污染幂等键、RUNNING 取消漏记违约金流水与漏退券、`reap` 重入队误退担保金及读写分离竞态。
 
-## 2. 全局架构契约的关键防呆设计
-- 在派发首张工单前先行发布 `GLOBAL_CONTRACT.md`，统一了各模块导入签名、`DomainError` 异常传递协议、整数美分双本位账本字段与 `SUM(frozen_cents) == active_escrow_cents` 全局不变量。
+## 2. 三工位紧编制切分与全局架构契约设计
+- 划分为 `data_billing`（`db.py`, `billing.py`）、`engine_gateway`（`jobs.py`, `auth.py`, `app.py`）与 `qa_verifier`（`tests/test_cloudhub.py`），一阶段双路并行、二阶段三路全并行推进。
 
-## 3. 代码审查与缺陷拦截实录
-- 在 `pricing_engine` 首轮提交 `sub_002` 中，通过审阅暂存 Diff 发现其在 UTC 高峰期将 `SPOT` 实例也误乘了 `1.2` 倍系数，当即 `REJECT` 指明 `priority != 'SPOT'` 边界并在 `sub_003` 修平；
-- 在 `job_lifecycle` 首轮提交 `sub_004` 中，审出 `RUNNING -> CANCELLED` 与 `QUEUED -> EXPIRED` 分支遗漏释放代金券占用，通过 `REJECT` 指导其在 `sub_005` 补齐 `_release_voucher`；
-- 网关层与测试层均执行了预合入叠加测试（`smoke` 与 `unittest`）后再批准合入。
+## 3. 第二阶段需求变更承接与架构耦合复盘
+- 一阶段冒烟通过后调用 `unlock_phase2`，使用 1 次免费契约升级额度平滑补充抢占补贴与母子授信协议，零返工一次合入。
 
-## 4. 终局自检覆盖面与已知遗留风险
-- 已通过 `qa_verifier` 集成测试与公开冒烟脚本验证了计费特例、违约金、退券复用与全局审计守恒；高并发极端竞争主要依赖 SQLite WAL + `BEGIN IMMEDIATE` 串行化事务锁保障。
+## 4. 代码审查拦截实录与真实测试覆盖边界
+- 全程 100% 裁决前实证预检；一阶段拦截 `SPOT` 高峰误乘 1.2 与 `RUNNING` 取消/`EXPIRED` 漏退代金券两处缺陷并一击修平，终局 `unittest` 全绿。
 """
     )
     return cli.run_dir

@@ -31,7 +31,7 @@ def run_lazy_baseline(runs_dir: Path, model_name: str = "baseline-lazy-s1") -> P
         ],
     )
 
-    raw_task = (cli.run_dir / "briefing" / "TASK.md").read_text(encoding="utf-8")[:3600]
+    raw_task = (cli.run_dir / "briefing" / "TASK.md").read_text(encoding="utf-8")[:1700]
     disp = cli.act(
         "dispatch_task",
         ["--worker-id", "all_worker", "--stdin"],

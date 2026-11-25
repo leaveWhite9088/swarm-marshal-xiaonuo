@@ -103,7 +103,43 @@ class TestScoringAndAuditUnits(unittest.TestCase):
             )
             self.assertEqual(ok1.returncode, 0)
 
-            # 同一评委重评为 26 分（surpasses-level5 yes）应覆盖生效
+            # 宗师门槛拦截测试：勾选 --grandmaster-tier no 但给 26.5 分（>25）必须拦截失败
+            bad_gm = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "src" / "scoring" / "judge_submit.py"),
+                    "--pack-dir",
+                    str(pdir),
+                    "--case-id",
+                    "case-01",
+                    "--judge-id",
+                    "j1",
+                    "--judge-model",
+                    "judge-model",
+                    "--D1",
+                    "10",
+                    "--D2",
+                    "9",
+                    "--D3",
+                    "7.5",
+                    "--surpasses-level5",
+                    "yes",
+                    "--grandmaster-tier",
+                    "no",
+                    "--evidence",
+                    "[C01] [P02] [P04]",
+                    "--note",
+                    "存在盲裁未达宗师门却误给超过25分",
+                    "--review-log",
+                    str(rlog),
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(bad_gm.returncode, 0)
+
+            # 同一评委重评为 26 分（surpasses-level5 yes + grandmaster-tier yes，引用 [P..] 证据）应覆盖生效
             ok2 = subprocess.run(
                 [
                     sys.executable,
@@ -124,10 +160,12 @@ class TestScoringAndAuditUnits(unittest.TestCase):
                     "7",
                     "--surpasses-level5",
                     "yes",
+                    "--grandmaster-tier",
+                    "yes",
                     "--evidence",
-                    "[C01] [W02] [R01]",
+                    "[C01] [P02] [P04] [R01]",
                     "--note",
-                    "复核后确认远超5级样本，但测试覆盖可再加并发场景",
+                    "复核后确认全面侦察、多路并行且零盲裁，满足宗师门槛",
                     "--review-log",
                     str(rlog),
                 ],
