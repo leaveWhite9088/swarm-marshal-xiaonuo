@@ -12,12 +12,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -31,7 +33,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.marshal.guardrails import inspect_code_smuggling, set_workspace_writable, validate_allowed_paths  # noqa: E402
-from src.marshal.state_store import MarshalStateStore  # noqa: E402
+from src.marshal.phase2_spec import PHASE2_TASK_MD  # noqa: E402
+from src.marshal.state_store import MarshalStateStore, now_iso  # noqa: E402
 from src.marshal.worker_driver import dispatch_to_worker  # noqa: E402
 
 WORKER_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{1,31}$")
@@ -129,11 +132,12 @@ def handle_define_contract(args, store: MarshalStateStore, state: dict, config: 
         action="define_contract",
         payload={**res, "content": content},
     )
-    msg = (
-        "【规划折损警告】全局契约已在派单中途被修改（已计入事后改约折损），后续派单与返工将同步新契约。"
-        if res.get("midflight_revision")
-        else "全局架构契约已先行确立，将在后续所有派单与返工中自动置顶只读注入。"
-    )
+    if res.get("used_phase2_evolution_credit"):
+        msg = "【二阶段契约平滑演进】已消耗 1 次二阶段免费契约升级额度（未计入事后改约折损），后续派单将同步新版契约。"
+    elif res.get("midflight_revision"):
+        msg = "【规划折损警告】全局契约已在派单中途被修改（已计入事后改约折损），后续派单与返工将同步新契约。"
+    else:
+        msg = "全局架构契约已先行确立，将在后续所有派单与返工中自动置顶只读注入。"
     return _emit(
         {
             "ok": True,
@@ -224,73 +228,122 @@ def handle_manage_worker(args, store: MarshalStateStore, state: dict, config: di
     )
 
 
-def handle_dispatch_task(args, store: MarshalStateStore, state: dict, config: dict) -> int:
+def _execute_worker_dispatch_unit(
+    store: MarshalStateStore,
+    wid: str,
+    ticket: str,
+    config: dict,
+    *,
+    wave_id: str | None = None,
+) -> tuple[int, dict]:
+    """线程/多进程安全的单工位派单执行单元：短锁抢占工位 -> 无锁并发运行底层工人 -> 短锁原子收割 Diff。"""
     limits = config.get("marshal_limits") or {}
-    wid = (args.worker_id or "").strip()
-    workers = state.get("workers") or {}
-    if wid not in workers:
-        return _record_tool_error(store, state, "dispatch_task", f"未知的工位 {wid!r}，请先调用 manage_worker 创建。")
+    max_disp = int(limits.get("max_dispatches", 15))
+    max_per_worker = int(limits.get("max_dispatches_per_worker", 6))
+    max_t_chars = int(limits.get("max_ticket_chars", 2000))
 
-    worker = workers[wid]
-    if worker.get("pending_submission_id"):
-        return _record_tool_error(
-            store,
-            state,
-            "dispatch_task",
-            f"工位 {wid} 仍有待审提交 {worker['pending_submission_id']} 尚未裁决！请先调用 review_submission（APPROVE 或 REJECT）后再派新单。",
+    with store.state_lock():
+        state = store.load_state()
+        workers = state.get("workers") or {}
+        if wid not in workers:
+            state["tool_error_count"] = int(state.get("tool_error_count", 0)) + 1
+            msg = f"未知的工位 {wid!r}，请先调用 manage_worker 创建。"
+            store.append_trace(state, event_type="tool_error", action="dispatch_task", payload={"error": msg, "worker_id": wid})
+            return 1, {"ok": False, "action": "dispatch_task", "worker_id": wid, "error": msg}
+
+        worker = workers[wid]
+        if worker.get("pending_submission_id"):
+            state["tool_error_count"] = int(state.get("tool_error_count", 0)) + 1
+            msg = f"工位 {wid} 仍有待审提交 {worker['pending_submission_id']} 尚未裁决！请先调用 review_submission（APPROVE 或 REJECT）后再派新单。"
+            store.append_trace(state, event_type="tool_error", action="dispatch_task", payload={"error": msg, "worker_id": wid})
+            return 1, {"ok": False, "action": "dispatch_task", "worker_id": wid, "error": msg}
+
+        now_ms_check = int(time.time() * 1000)
+        if worker.get("in_flight_job_id") and (now_ms_check - int(worker.get("in_flight_started_ms") or 0)) < 300_000:
+            state["tool_error_count"] = int(state.get("tool_error_count", 0)) + 1
+            msg = f"工位 {wid} 当前正在执行在途任务 {worker['in_flight_job_id']}，请勿对同一工位重复并发派单！"
+            store.append_trace(state, event_type="tool_error", action="dispatch_task", payload={"error": msg, "worker_id": wid})
+            return 1, {"ok": False, "action": "dispatch_task", "worker_id": wid, "error": msg}
+
+        in_flight_cnt = sum(
+            1
+            for w in workers.values()
+            if w.get("in_flight_job_id") and (now_ms_check - int(w.get("in_flight_started_ms") or 0)) < 300_000
         )
+        used = int(state.get("dispatches_used", 0))
+        if used + in_flight_cnt >= max_disp:
+            state["tool_error_count"] = int(state.get("tool_error_count", 0)) + 1
+            msg = f"全局派单预算已耗尽（已用 {used} + 在途 {in_flight_cnt} >= {max_disp} 单），严禁靠无限试错硬磨！"
+            store.append_trace(state, event_type="tool_error", action="dispatch_task", payload={"error": msg, "worker_id": wid})
+            return 1, {"ok": False, "action": "dispatch_task", "worker_id": wid, "error": msg}
 
-    max_disp = int(limits.get("max_dispatches", 14))
-    used = int(state.get("dispatches_used", 0))
-    if used >= max_disp:
-        return _record_tool_error(store, state, "dispatch_task", f"全局派单预算已耗尽（{used}/{max_disp} 单），严禁靠无限试错硬磨！")
+        w_used = int(worker.get("dispatch_count", 0))
+        if w_used >= max_per_worker:
+            state["tool_error_count"] = int(state.get("tool_error_count", 0)) + 1
+            msg = f"工位 {wid} 累计唤醒已达单工位上限（{w_used}/{max_per_worker} 次），禁止向单一工位过度倾倒工单！"
+            store.append_trace(state, event_type="tool_error", action="dispatch_task", payload={"error": msg, "worker_id": wid})
+            return 1, {"ok": False, "action": "dispatch_task", "worker_id": wid, "error": msg}
 
-    max_per_worker = int(limits.get("max_dispatches_per_worker", 5))
-    w_used = int(worker.get("dispatch_count", 0))
-    if w_used >= max_per_worker:
-        return _record_tool_error(
-            store,
-            state,
-            "dispatch_task",
-            f"工位 {wid} 累计唤醒已达单工位上限（{w_used}/{max_per_worker} 次），禁止向单一工位过度倾倒工单！",
-        )
+        if not ticket:
+            state["tool_error_count"] = int(state.get("tool_error_count", 0)) + 1
+            msg = "工单内容不能为空。"
+            store.append_trace(state, event_type="tool_error", action="dispatch_task", payload={"error": msg, "worker_id": wid})
+            return 1, {"ok": False, "action": "dispatch_task", "worker_id": wid, "error": msg}
 
-    try:
-        ticket = _read_text_input(args.ticket, args.ticket_file, args.stdin, "工单指令").strip()
-    except ValueError as exc:
-        return _record_tool_error(store, state, "dispatch_task", str(exc))
+        if len(ticket) > max_t_chars:
+            state["tool_error_count"] = int(state.get("tool_error_count", 0)) + 1
+            msg = f"单张工单长度超限（{len(ticket)} > {max_t_chars} 字符），请精简拆单。"
+            store.append_trace(state, event_type="tool_error", action="dispatch_task", payload={"error": msg, "worker_id": wid})
+            return 1, {"ok": False, "action": "dispatch_task", "worker_id": wid, "error": msg}
 
-    if not ticket:
-        return _record_tool_error(store, state, "dispatch_task", "工单内容不能为空。")
-    max_t_chars = int(limits.get("max_ticket_chars", 4000))
-    if len(ticket) > max_t_chars:
-        return _record_tool_error(store, state, "dispatch_task", f"单张工单长度超限（{len(ticket)} > {max_t_chars} 字符），请精简拆单。")
+        clean, detail = inspect_code_smuggling(ticket, "ticket", limits)
+        if not clean:
+            state["code_smuggling_count"] = int(state.get("code_smuggling_count", 0)) + 1
+            store.append_trace(
+                state,
+                event_type="violation",
+                action="code_smuggling_intercepted",
+                payload={"source_action": "dispatch_task", "worker_id": wid, **detail},
+            )
+            return (
+                2,
+                {
+                    "ok": False,
+                    "action": "dispatch_task",
+                    "worker_id": wid,
+                    "error": "【防代写护栏拦截】检测到输入中包含大段现成 Python 业务实现代码！统帅只能写职责边界、函数签名契约、逻辑步骤、防呆约束或具体问题行批注，严禁替工人代写源码（本次已计入违规调度）。",
+                    "smuggling_detail": detail,
+                },
+            )
 
-    clean, detail = inspect_code_smuggling(ticket, "ticket", limits)
-    if not clean:
-        return _record_smuggling_block(store, state, "dispatch_task", detail)
+        if state.get("contract_defined_before_first_dispatch") is None:
+            state["contract_defined_before_first_dispatch"] = bool(int(state.get("contract_version", 0)) > 0)
 
-    if state.get("contract_defined_before_first_dispatch") is None:
-        state["contract_defined_before_first_dispatch"] = bool(int(state.get("contract_version", 0)) > 0)
+        started_ms = int(time.time() * 1000)
+        job_id = f"disp_{used + in_flight_cnt + 1:03d}_{wid}"
+        trunk_manifest_snap = dict(state.get("trunk_manifest") or {})
+        base_hashes_snap = {rel: trunk_manifest_snap.get(rel) for rel in worker["allowed_paths"]}
+        worker["in_flight_job_id"] = job_id
+        worker["in_flight_started_ms"] = started_ms
+        worker_snap = dict(worker)
+        worker_mode = state["worker_mode"]
+        staging_ws, sys_prompt_file = store.prepare_worker_staging(worker_snap, base_submission=None)
+        w_sess_dir = store.pi_sessions_root / wid
+        if int(worker.get("dispatch_count", 0)) == 0 and w_sess_dir.exists():
+            shutil.rmtree(w_sess_dir, ignore_errors=True)
+        contract_text = store.read_contract()
         store.save_state(state)
-
-    staging_ws, sys_prompt_file = store.prepare_worker_staging(worker, base_submission=None)
-    w_sess_dir = store.pi_sessions_root / wid
-    if int(worker.get("dispatch_count", 0)) == 0 and w_sess_dir.exists():
-        shutil.rmtree(w_sess_dir, ignore_errors=True)
-    contract_text = store.read_contract()
-    job_id = f"disp_{used + 1:03d}_{wid}"
 
     try:
         drv_res = dispatch_to_worker(
-            mode=state["worker_mode"],
+            mode=worker_mode,
             repo_root=ROOT,
             staging_workspace=staging_ws,
             system_prompt_file=sys_prompt_file,
             session_dir=store.pi_sessions_root / wid,
             transcripts_dir=store.transcripts_root,
             results_dir=store.results_root,
-            worker=worker,
+            worker=worker_snap,
             contract_text=contract_text,
             ticket=ticket,
             job_id=job_id,
@@ -298,51 +351,170 @@ def handle_dispatch_task(args, store: MarshalStateStore, state: dict, config: di
             is_rework=False,
         )
     except Exception as exc:
-        return _record_infra_error(store, state, "dispatch_task", f"底层工人执行异常: {exc}")
+        with store.state_lock():
+            state = store.load_state()
+            w_cur = (state.get("workers") or {}).get(wid) or {}
+            w_cur["in_flight_job_id"] = None
+            w_cur["in_flight_started_ms"] = None
+            store.restore_trunk_from_history(state)
+            msg = f"底层工人执行异常: {exc}"
+            store.append_trace(state, event_type="infra_error", action="dispatch_task", payload={"worker_id": wid, "error": msg})
+            return (
+                1,
+                {
+                    "ok": False,
+                    "action": "dispatch_task",
+                    "worker_id": wid,
+                    "infra_error": True,
+                    "dispatches_used": state.get("dispatches_used", 0),
+                    "error": f"{msg}（基础设施异常未扣除派单预算，也未计入违规，请直接重试）",
+                },
+            )
 
-    state["dispatches_used"] = used + 1
-    store.save_state(state)
+    finished_ms = int(time.time() * 1000)
+    with store.state_lock():
+        state = store.load_state()
+        store.restore_trunk_from_history(state)
+        worker = (state.get("workers") or {})[wid]
+        worker["in_flight_job_id"] = None
+        worker["in_flight_started_ms"] = None
+        if state.get("phase2_unlocked") and int(state.get("phase2_free_contract_credit", 0)) > 0:
+            state["phase2_free_contract_credit"] = 0
+        state["dispatches_used"] = int(state.get("dispatches_used", 0)) + 1
 
-    harvested = store.harvest_worker_submission(
-        state,
-        worker,
-        ticket=ticket,
-        driver_result=drv_res,
-        rework_of=None,
-    )
-    store.append_trace(
-        state,
-        event_type="tool",
-        action="dispatch_task",
-        payload={
-            "worker_id": wid,
-            "dispatch_index": state["dispatches_used"],
-            "ticket": ticket,
-            "submission_id": harvested["submission_id"],
-            "changed_files": harvested["changed_files"],
-            "syntax_ok": harvested["syntax_ok"],
-            "syntax_errors": harvested["syntax_errors"],
-            "unauthorized_files_stripped": harvested["unauthorized_files_stripped"],
-            "worker_summary": harvested["worker_summary"],
-            "worker_tokens": harvested["worker_tokens"],
-            "diff_chars": harvested["diff_chars"],
-        },
-    )
+        harvested = store.harvest_worker_submission(
+            state,
+            worker,
+            ticket=ticket,
+            driver_result=drv_res,
+            rework_of=None,
+            started_ms=started_ms,
+            finished_ms=finished_ms,
+            base_hashes_override=base_hashes_snap,
+        )
+        store.append_trace(
+            state,
+            event_type="tool",
+            action="dispatch_task",
+            payload={
+                "worker_id": wid,
+                "wave_id": wave_id,
+                "dispatch_index": state["dispatches_used"],
+                "started_ms": started_ms,
+                "finished_ms": finished_ms,
+                "ticket": ticket,
+                "submission_id": harvested["submission_id"],
+                "changed_files": harvested["changed_files"],
+                "syntax_ok": harvested["syntax_ok"],
+                "syntax_errors": harvested["syntax_errors"],
+                "unauthorized_files_stripped": harvested["unauthorized_files_stripped"],
+                "worker_summary": harvested["worker_summary"],
+                "worker_tokens": harvested["worker_tokens"],
+                "diff_chars": harvested["diff_chars"],
+            },
+        )
+        return (
+            0,
+            {
+                "ok": True,
+                "action": "dispatch_task",
+                "wave_id": wave_id,
+                "submission_id": harvested["submission_id"],
+                "worker_id": wid,
+                "dispatches_used": state["dispatches_used"],
+                "dispatches_remaining": max_disp - state["dispatches_used"],
+                "changed_files": harvested["changed_files"],
+                "syntax_ok": harvested["syntax_ok"],
+                "syntax_errors": harvested["syntax_errors"],
+                "unauthorized_files_stripped": harvested["unauthorized_files_stripped"],
+                "worker_summary": harvested["worker_summary"],
+                "diff": harvested["diff"],
+            },
+        )
+
+
+def handle_dispatch_task(args, store: MarshalStateStore, state: dict, config: dict) -> int:
+    wid = (args.worker_id or "").strip()
+    try:
+        ticket = _read_text_input(args.ticket, args.ticket_file, args.stdin, "工单指令").strip()
+    except ValueError as exc:
+        with store.state_lock():
+            fresh = store.load_state()
+            return _record_tool_error(store, fresh, "dispatch_task", str(exc))
+    rc, resp = _execute_worker_dispatch_unit(store, wid, ticket, config, wave_id=None)
+    return _emit(resp, exit_code=rc)
+
+
+def handle_dispatch_parallel(args, store: MarshalStateStore, state: dict, config: dict) -> int:
+    """同波次向多个互不重叠的空闲工位并发派单（基于线程池同时驱动多个隔离沙箱工人）。"""
+    raw_specs: list[str] = list(args.tasks or [])
+    if not raw_specs:
+        with store.state_lock():
+            fresh = store.load_state()
+            return _record_tool_error(store, fresh, "dispatch_parallel", "必须通过 --tasks 至少指定一项 <worker_id>:<ticket_file>。")
+
+    parsed_pairs: list[tuple[str, str]] = []
+    seen_wids: set[str] = set()
+    for item in raw_specs:
+        if ":" not in item:
+            with store.state_lock():
+                fresh = store.load_state()
+                return _record_tool_error(
+                    store,
+                    fresh,
+                    "dispatch_parallel",
+                    f"参数格式错误 {item!r}，应为 <worker_id>:<ticket_file_path>。",
+                )
+        wid, tpath_str = item.split(":", 1)
+        wid = wid.strip()
+        fp = Path(tpath_str.strip())
+        if not wid or not fp.is_file():
+            with store.state_lock():
+                fresh = store.load_state()
+                return _record_tool_error(
+                    store,
+                    fresh,
+                    "dispatch_parallel",
+                    f"找不到工位 {wid!r} 对应的工单文件: {tpath_str!r}",
+                )
+        if wid in seen_wids:
+            with store.state_lock():
+                fresh = store.load_state()
+                return _record_tool_error(
+                    store,
+                    fresh,
+                    "dispatch_parallel",
+                    f"同波次并行派单中工位 {wid!r} 重复出现，每个工位每波最多派发一张工单。",
+                )
+        seen_wids.add(wid)
+        parsed_pairs.append((wid, fp.read_text(encoding="utf-8").strip()))
+
+    wave_id = f"wave_{int(time.time() * 1000)}"
+    results: list[dict] = []
+    codes: list[int] = []
+
+    def _run_one(pair: tuple[str, str]) -> tuple[int, dict]:
+        return _execute_worker_dispatch_unit(store, pair[0], pair[1], config, wave_id=wave_id)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(parsed_pairs)) as pool:
+        for rc, obj in pool.map(_run_one, parsed_pairs):
+            codes.append(rc)
+            results.append(obj)
+
+    fresh_after = store.load_state()
+    max_disp = int((config.get("marshal_limits") or {}).get("max_dispatches", 15))
+    all_ok = all(c == 0 for c in codes)
     return _emit(
         {
-            "ok": True,
-            "action": "dispatch_task",
-            "submission_id": harvested["submission_id"],
-            "worker_id": wid,
-            "dispatches_used": state["dispatches_used"],
-            "dispatches_remaining": max_disp - state["dispatches_used"],
-            "changed_files": harvested["changed_files"],
-            "syntax_ok": harvested["syntax_ok"],
-            "syntax_errors": harvested["syntax_errors"],
-            "unauthorized_files_stripped": harvested["unauthorized_files_stripped"],
-            "worker_summary": harvested["worker_summary"],
-            "diff": harvested["diff"],
-        }
+            "ok": all_ok,
+            "action": "dispatch_parallel",
+            "wave_id": wave_id,
+            "parallel_count": len(parsed_pairs),
+            "dispatches_used": fresh_after.get("dispatches_used", 0),
+            "dispatches_remaining": max_disp - int(fresh_after.get("dispatches_used", 0)),
+            "results": results,
+        },
+        exit_code=(0 if all_ok else max(codes)),
     )
 
 
@@ -367,10 +539,13 @@ def handle_inspect_and_test(args, store: MarshalStateStore, state: dict, config:
     if target == "status":
         pending = [s["submission_id"] for s in subs.values() if s.get("status") == "PENDING"]
         payload = {
+            "phase": state.get("phase", 1),
+            "phase2_unlocked": bool(state.get("phase2_unlocked", False)),
+            "phase2_free_contract_credit": int(state.get("phase2_free_contract_credit", 0)),
             "contract_version": state.get("contract_version", 0),
             "contract_chars": state.get("contract_chars", 0),
             "dispatches_used": state.get("dispatches_used", 0),
-            "max_dispatches": state.get("max_dispatches", 30),
+            "max_dispatches": state.get("max_dispatches", 15),
             "workers": {
                 k: {
                     "allowed_paths": v["allowed_paths"],
@@ -624,7 +799,7 @@ def handle_review_submission(args, store: MarshalStateStore, state: dict, config
 
         if args.discard:
             sub["status"] = "REJECTED"
-            sub["reviewed_at"] = store.load_state().get("created_at")
+            sub["reviewed_at"] = now_iso()
             sub["review_comment"] = comment
             worker["rejected_count"] = int(worker.get("rejected_count", 0)) + 1
             if worker.get("pending_submission_id") == sub_id:
@@ -663,6 +838,9 @@ def handle_review_submission(args, store: MarshalStateStore, state: dict, config
         orig_ticket = sub.get("ticket") or sub.get("ticket_preview", "")
         job_id = f"rework_{used + 1:03d}_{wid}"
 
+        started_ms = int(time.time() * 1000)
+        trunk_manifest_snap = dict(state.get("trunk_manifest") or {})
+        base_hashes_snap = {rel: trunk_manifest_snap.get(rel) for rel in worker["allowed_paths"]}
         try:
             drv_res = dispatch_to_worker(
                 mode=state["worker_mode"],
@@ -681,55 +859,69 @@ def handle_review_submission(args, store: MarshalStateStore, state: dict, config
                 review_comment=comment,
             )
         except Exception as exc:
-            return _record_infra_error(store, state, "review_submission", f"工人返工执行异常: {exc}")
+            with store.state_lock():
+                state = store.load_state()
+                store.restore_trunk_from_history(state)
+                return _record_infra_error(store, state, "review_submission", f"工人返工执行异常: {exc}")
 
-        sub["status"] = "REJECTED"
-        sub["reviewed_at"] = store.load_state().get("created_at")
-        sub["review_comment"] = comment
-        worker["rejected_count"] = int(worker.get("rejected_count", 0)) + 1
-        if worker.get("pending_submission_id") == sub_id:
-            worker["pending_submission_id"] = None
-        state["dispatches_used"] = used + 1
-        store.save_state(state)
+        finished_ms = int(time.time() * 1000)
+        with store.state_lock():
+            state = store.load_state()
+            store.restore_trunk_from_history(state)
+            sub = (state.get("submissions") or {})[sub_id]
+            worker = (state.get("workers") or {})[wid]
+            sub["status"] = "REJECTED"
+            sub["reviewed_at"] = now_iso()
+            sub["review_comment"] = comment
+            worker["rejected_count"] = int(worker.get("rejected_count", 0)) + 1
+            if worker.get("pending_submission_id") == sub_id:
+                worker["pending_submission_id"] = None
+            state["dispatches_used"] = int(state.get("dispatches_used", 0)) + 1
+            store.save_state(state)
 
-        store.append_trace(
-            state,
-            event_type="tool",
-            action="review_submission",
-            payload={
-                "submission_id": sub_id,
-                "worker_id": wid,
-                "decision": "REJECT",
-                "rework_depth_next": cur_depth + 1,
-                "comment": comment,
-                "inspected_before_review": bool(sub.get("inspected_before_review")),
-                "tested_before_review": bool(sub.get("tested_before_review")),
-                "discard_only": False,
-            },
-        )
+            store.append_trace(
+                state,
+                event_type="tool",
+                action="review_submission",
+                payload={
+                    "submission_id": sub_id,
+                    "worker_id": wid,
+                    "decision": "REJECT",
+                    "rework_depth_next": cur_depth + 1,
+                    "comment": comment,
+                    "inspected_before_review": bool(sub.get("inspected_before_review")),
+                    "tested_before_review": bool(sub.get("tested_before_review")),
+                    "discard_only": False,
+                },
+            )
 
-        harvested = store.harvest_worker_submission(
-            state,
-            worker,
-            ticket=orig_ticket,
-            driver_result=drv_res,
-            rework_of=sub_id,
-        )
-        store.append_trace(
-            state,
-            event_type="tool",
-            action="rework_completed",
-            payload={
-                "rework_of": sub_id,
-                "worker_id": wid,
-                "dispatch_index": state["dispatches_used"],
-                "new_submission_id": harvested["submission_id"],
-                "changed_files": harvested["changed_files"],
-                "syntax_ok": harvested["syntax_ok"],
-                "worker_summary": harvested["worker_summary"],
-                "worker_tokens": harvested["worker_tokens"],
-            },
-        )
+            harvested = store.harvest_worker_submission(
+                state,
+                worker,
+                ticket=orig_ticket,
+                driver_result=drv_res,
+                rework_of=sub_id,
+                started_ms=started_ms,
+                finished_ms=finished_ms,
+                base_hashes_override=base_hashes_snap,
+            )
+            store.append_trace(
+                state,
+                event_type="tool",
+                action="rework_completed",
+                payload={
+                    "rework_of": sub_id,
+                    "worker_id": wid,
+                    "dispatch_index": state["dispatches_used"],
+                    "started_ms": started_ms,
+                    "finished_ms": finished_ms,
+                    "new_submission_id": harvested["submission_id"],
+                    "changed_files": harvested["changed_files"],
+                    "syntax_ok": harvested["syntax_ok"],
+                    "worker_summary": harvested["worker_summary"],
+                    "worker_tokens": harvested["worker_tokens"],
+                },
+            )
         return _emit(
             {
                 "ok": True,
@@ -752,8 +944,79 @@ def handle_review_submission(args, store: MarshalStateStore, state: dict, config
     return _record_tool_error(store, state, "review_submission", f"非法的 decision: {decision}（只能是 APPROVE 或 REJECT）")
 
 
+def handle_unlock_phase2(args, store: MarshalStateStore, state: dict, config: dict) -> int:
+    if state.get("phase2_unlocked"):
+        p2_path = store.briefing_dir / "PHASE2_TASK.md"
+        return _emit(
+            {
+                "ok": True,
+                "action": "unlock_phase2",
+                "already_unlocked": True,
+                "phase": 2,
+                "briefing_phase2_path": str(p2_path),
+                "phase2_free_contract_credit": int(state.get("phase2_free_contract_credit", 0)),
+                "message": "第二阶段已处于解锁状态，请直接阅读 briefing/PHASE2_TASK.md 继续推进。",
+            }
+        )
+
+    subs = state.get("submissions") or {}
+    pending = [k for k, v in subs.items() if v.get("status") == "PENDING"]
+    if pending:
+        return _record_tool_error(
+            store,
+            state,
+            "unlock_phase2",
+            f"当前仍有待审提交 {pending} 尚未裁决，请先完成第一阶段提交审查（APPROVE 或 REJECT）后再解锁第二阶段。",
+        )
+
+    approved_cnt = sum(1 for v in subs.values() if v.get("status") == "APPROVED")
+    if approved_cnt < 1:
+        return _record_tool_error(
+            store,
+            state,
+            "unlock_phase2",
+            "尚未合入任何第一阶段重构提交！严禁在完成第一阶段排雷与合入前提前窥探第二阶段需求。",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="marshal_p2_gate_") as tmp:
+        temp_ws = Path(tmp) / "workspace"
+        shutil.copytree(store.workspace_dir, temp_ws)
+        set_workspace_writable(temp_ws, True)
+        try:
+            rc, out, err = _run_sandbox_command(temp_ws, [sys.executable, "smoke_public.py"], timeout_sec=30)
+        except subprocess.TimeoutExpired:
+            rc, out, err = 124, "", "第一阶段连通冒烟检查超时"
+
+    if rc != 0:
+        return _record_tool_error(
+            store,
+            state,
+            "unlock_phase2",
+            f"第一阶段主干尚未通过基础冒烟连通检查（returncode={rc}），请先修复第一阶段主干后再解锁第二阶段。{(out + err)[-400:]}",
+        )
+
+    res = store.unlock_phase2_in_store(state, PHASE2_TASK_MD)
+    store.append_trace(
+        state,
+        event_type="phase",
+        action="unlock_phase2",
+        payload=res,
+    )
+    return _emit(
+        {
+            "ok": True,
+            "action": "unlock_phase2",
+            **res,
+            "message": (
+                "第二阶段已成功解锁！请立即阅读案头目录 `briefing/PHASE2_TASK.md`，"
+                "你在派发首张二阶段工单前拥有 1 次免费调用 `define_contract` 升级全局契约的豁免额度。"
+            ),
+        }
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="群智统帅五大团队管理命令入口")
+    ap = argparse.ArgumentParser(description="群智统帅团队管理与双阶段演进命令入口")
     ap.add_argument("--model", required=True, help="被测统帅模型标识")
     ap.add_argument("--runs-dir", default=None, help="运行目录根路径（默认 runs/）")
     sub = ap.add_subparsers(dest="action", required=True)
@@ -764,8 +1027,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_con.add_argument("--stdin", action="store_true", help="从标准输入读取契约内容")
 
     p_wrk = sub.add_parser("manage_worker", help="创建或更新下属工位、岗位提示词与白名单领地")
-    p_wrk.add_argument("--worker-id", required=True, help="工位代号，如 db_worker")
-    p_wrk.add_argument("--allowed-paths", nargs="+", required=True, help="允许读写的相对文件路径列表（上限 4 个 .py 文件）")
+    p_wrk.add_argument("--worker-id", required=True, help="工位代号，如 core_data")
+    p_wrk.add_argument("--allowed-paths", nargs="+", required=True, help="允许读写的相对文件路径列表（上限 3 个 .py 文件）")
     p_wrk.add_argument("--role-prompt", default=None, help="岗位系统提示词")
     p_wrk.add_argument("--role-file", default=None, help="从文件读取岗位提示词")
     p_wrk.add_argument("--stdin", action="store_true", help="从标准输入读取岗位提示词")
@@ -775,6 +1038,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_dsp.add_argument("--ticket", default=None, help="具体任务工单文本（严禁夹带现成业务源码）")
     p_dsp.add_argument("--ticket-file", default=None, help="从文件读取工单文本")
     p_dsp.add_argument("--stdin", action="store_true", help="从标准输入读取工单文本")
+
+    p_par = sub.add_parser("dispatch_parallel", help="同波次向多个空闲下属工位并发派活")
+    p_par.add_argument(
+        "--tasks",
+        nargs="+",
+        required=True,
+        help="多项 <worker_id>:<ticket_file> 列表，如 data_billing:draft/t1.md engine_gateway:draft/t2.md",
+    )
 
     p_ins = sub.add_parser("inspect_and_test", help="查看状态/代码/Diff 或运行冒烟及单元测试")
     p_ins.add_argument("--target", choices=["status", "trunk", "staging", "smoke", "unittest"], required=True)
@@ -789,6 +1060,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rev.add_argument("--comment-file", default=None, help="从文件读取审查批注")
     p_rev.add_argument("--stdin", action="store_true", help="从标准输入读取审查批注")
     p_rev.add_argument("--discard", action="store_true", help="仅在 REJECT 时生效：只废弃该提交并解锁工位，不立即唤醒工人返工")
+
+    sub.add_parser("unlock_phase2", help="在一阶段主干重构合入且冒烟通过后，解锁第二阶段紧急业务演进需求")
 
     return ap
 
@@ -826,8 +1099,10 @@ def main() -> int:
         "define_contract": handle_define_contract,
         "manage_worker": handle_manage_worker,
         "dispatch_task": handle_dispatch_task,
+        "dispatch_parallel": handle_dispatch_parallel,
         "inspect_and_test": handle_inspect_and_test,
         "review_submission": handle_review_submission,
+        "unlock_phase2": handle_unlock_phase2,
     }
     return dispatch_map[args.action](args, store, state, config)
 

@@ -1,7 +1,7 @@
 {
   "benchmark_id": "swarm-marshal-xiaonuo",
-  "version": "xiaonuo-v1.0",
-  "title": "群智统帅 · 架构拆解与团队统领基准",
+  "version": "xiaonuo-v2.0",
+  "title": "群智统帅 · 存量排雷、双阶段演进与团队统领基准",
   "worker_harness": {
     "mode": "pi",
     "harness": "pi",
@@ -37,72 +37,82 @@
     }
   },
   "marshal_limits": {
-    "max_workers": 5,
-    "max_files_per_worker": 4,
-    "max_dispatches": 14,
-    "max_dispatches_per_worker": 5,
+    "max_workers": 3,
+    "max_files_per_worker": 3,
+    "max_dispatches": 15,
+    "max_dispatches_per_worker": 6,
     "max_reworks_per_ticket": 2,
-    "max_ticket_chars": 4000,
-    "max_role_prompt_chars": 2500,
-    "max_contract_chars": 15000,
-    "max_review_comment_chars": 2500,
+    "max_ticket_chars": 2000,
+    "max_role_prompt_chars": 1200,
+    "max_contract_chars": 5500,
+    "max_review_comment_chars": 1500,
     "allowed_root_prefixes": [
       "cloudhub/",
       "tests/"
     ],
     "protected_paths": [
       "TASK.md",
+      "PHASE2_TASK.md",
       "smoke_public.py",
       "GLOBAL_CONTRACT.md"
     ],
     "code_smuggling": {
       "max_consecutive_code_lines": 7,
-      "max_total_impl_lines_ticket": 12,
-      "max_total_impl_lines_contract": 10,
-      "max_impl_line_ratio": 0.28
+      "max_total_impl_lines_ticket": 10,
+      "max_total_impl_lines_contract": 8,
+      "max_impl_line_ratio": 0.25
     }
   },
   "scoring": {
     "A": {
-      "max": 30.0,
-      "a1_core_e2e_max": 12.0,
-      "a2_invariants_max": 10.0,
-      "a3_resilience_max": 8.0
+      "max": 25.0,
+      "a1_core_e2e_max": 5.0,
+      "a2_invariants_max": 7.0,
+      "a3_phase2_evolution_max": 7.5,
+      "a4_chaos_security_max": 5.5
     },
     "B": {
-      "max": 15.0,
-      "b1_economy_max": 5.0,
+      "max": 20.0,
+      "b1_economy_max": 10.0,
       "b2_timing_max": 10.0,
-      "b1_ideal_dispatches": 7,
-      "b1_max_dispatches": 14,
-      "b1_ideal_first_pass_ratio": 0.70,
+      "b1_target_parallel_ratio": 0.45,
+      "b1_ideal_dispatches": 8,
+      "b1_max_dispatches": 15,
+      "b1_ideal_first_pass_ratio": 0.72,
       "b1_floor_first_pass_ratio": 0.35,
-      "b1_smuggling_penalty": 0.5,
-      "b1_midflight_contract_penalty": 0.5,
-      "b1_tool_error_penalty": 0.25,
-      "b2_free_min": 6.0,
-      "b2_halflife_min": 8.0,
+      "b1_pi_token_free": 4800000,
+      "b1_pi_token_halflife": 4500000,
+      "b1_mock_token_free": 16000,
+      "b1_mock_token_halflife": 14000,
+      "b1_smuggling_penalty": 0.8,
+      "b1_midflight_contract_penalty": 0.8,
+      "b1_tool_error_penalty": 0.35,
+      "b2_free_min": 20.0,
+      "b2_halflife_min": 18.0,
       "cap_by_a_ratio": true
     },
     "C": {
       "max": 25.0,
-      "c1_orthogonality_max": 9.0,
-      "c2_review_gate_max": 8.0,
-      "c3_topology_balance_max": 8.0,
+      "c1_recon_and_evolution_max": 8.0,
+      "c2_empirical_review_max": 9.0,
+      "c3_synergy_balance_max": 8.0,
       "c1_midflight_contract_penalty": 1.5,
-      "free_reworks_allowance": 2,
-      "excess_rework_penalty": 1.2,
-      "dispatch_bloat_threshold": 9,
-      "dispatch_bloat_penalty": 0.5,
-      "low_delivery_gate_threshold_a": 12.0,
-      "low_delivery_gate_floor": 0.25
+      "blind_verdict_penalty": 0.65,
+      "rework_step_decay": 0.30,
+      "ineffective_rework_penalty": 0.90,
+      "same_worker_streak_penalty": 0.85,
+      "dispatch_bloat_threshold": 10,
+      "dispatch_bloat_penalty": 0.4,
+      "low_delivery_gate_threshold_a": 15.0,
+      "low_delivery_gate_floor": 0.20
     },
     "D": {
       "max": 30.0,
       "d1_team_contract_max": 11.0,
       "d2_decomposition_max": 10.0,
       "d3_review_leadership_max": 9.0,
-      "level5_mediocre_cap_total": 15.0
+      "level5_mediocre_cap_total": 15.0,
+      "grandmaster_gate_total": 25.0
     }
   }
 }

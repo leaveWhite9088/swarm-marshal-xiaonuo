@@ -111,22 +111,31 @@ def _analyze_quality_signals(
     ) >= 3
 
     clusters = _count_rule_clusters(ticket)
-    raw_copy_paste = ("十八条核心业务规则" in ticket) or ("完整 http 路由契约速查表" in ticket.lower())
+    raw_copy_paste = (
+        ("十八条核心业务规则" in ticket)
+        or ("完整 http 路由契约速查表" in ticket.lower())
+        or ("项目总需求书" in ticket)
+        or ("第一阶段 http 路由契约速查表" in ticket.lower())
+    )
     overloaded = raw_copy_paste or (clusters >= overload_clusters and len(ticket) >= overload_chars)
 
     # 判断工单拆解是否精细（明确给出具体边界条件，而不是一句“把模块写一下”或整篇照抄原题）
     focused_ticket = (not overloaded) and (len(ticket.strip()) >= 90) and (len(role_prompt.strip()) >= 25)
 
     # 具体业务细节信号
-    mentions_migration = any(k in comb_low for k in ("alter table", "pragma", "table_info", "v1", "老库", "在线迁"))
+    mentions_migration = any(k in comb_low for k in ("alter table", "pragma", "table_info", "v1", "老库", "在线迁", "期初"))
     mentions_idempotency = any(k in comb_low for k in ("idempotency", "幂等", "409", "body_sha256", "sha256"))
-    mentions_brackets = any(k in comb_low for k in ("600", "80%", "两段", "阶梯", "bracket"))
+    mentions_brackets = any(k in comb_low for k in ("600", "3600", "80%", "60%", "三段", "两段", "阶梯", "bracket"))
     mentions_vouchers = any(k in comb_low for k in ("voucher", "代金券", "min_spend"))
     mentions_overrun = any(k in comb_low for k in ("1.2", "120", "overrun", "超支", "billable_gpu_sec", "402"))
     mentions_reaper_retry = any(k in comb_low for k in ("retry_count", "max_retries", "reap", "requeue", "重入队"))
     mentions_running_penalty = any(k in comb_low for k in ("10%", "penalty", "违约金", "cancel_penalty"))
     mentions_audit = any(k in comb_low for k in ("active_escrow_cents", "all_balanced", "audit", "守恒"))
     mentions_concurrency = any(k in comb_low for k in ("begin immediate", "并发", "lock", "threading"))
+    mentions_phase2 = any(
+        k in comb_low or k in c_low
+        for k in ("preempt", "抢占", "bind-parent", "bind_parent", "org_transfer", "credit_limit", "母账户", "授信")
+    )
 
     # 审查打回（REJECT）是否具体点中要害（而非“报错了重修”）
     rev_low = (review_comment or "").lower()
@@ -153,6 +162,7 @@ def _analyze_quality_signals(
         "mentions_running_penalty": mentions_running_penalty and not overloaded,
         "mentions_audit": mentions_audit and not overloaded,
         "mentions_concurrency": (mentions_concurrency or strong_contract) and not overloaded,
+        "mentions_phase2": mentions_phase2 and not overloaded,
         "fix_spot_peak": fix_spot_peak,
         "fix_voucher_release": fix_voucher_release,
         "is_rework": is_rework,
@@ -185,6 +195,14 @@ def open_tenant_store(path: str):
     do_mig = sig["mentions_migration"] and sig["focused_ticket"]
     do_idem = sig["mentions_idempotency"] and sig["focused_ticket"]
     use_imm = sig["mentions_concurrency"]
+    do_phase2 = bool(sig.get("mentions_phase2")) and sig["focused_ticket"]
+    p2_cols_sql = (
+        "                parent_tenant_id TEXT,\n"
+        "                credit_limit_cents INTEGER NOT NULL DEFAULT 0,\n"
+        "                org_drawn_cents INTEGER NOT NULL DEFAULT 0,\n"
+        if do_phase2
+        else ""
+    )
 
     return f'''# -*- coding: utf-8 -*-
 """CloudHub SQLite persistence, schema migration, idempotency, and double-entry ledger."""
@@ -249,7 +267,7 @@ def init_db(db_path: str) -> None:
                 quota_gpu_sec INTEGER NOT NULL DEFAULT 3600,
                 used_gpu_sec INTEGER NOT NULL DEFAULT 0,
                 initial_Carry_cents INTEGER NOT NULL DEFAULT 0,
-                api_secret TEXT NOT NULL DEFAULT '',
+{p2_cols_sql}                api_secret TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL DEFAULT 0
             )
             """
@@ -335,6 +353,13 @@ def init_db(db_path: str) -> None:
                 conn.execute("ALTER TABLE tenants ADD COLUMN used_gpu_sec INTEGER NOT NULL DEFAULT 0")
             if "initial_Carry_cents" not in tcols:
                 conn.execute("ALTER TABLE tenants ADD COLUMN initial_Carry_cents INTEGER NOT NULL DEFAULT 0")
+            if {str(bool(do_phase2))}:
+                if "parent_tenant_id" not in tcols:
+                    conn.execute("ALTER TABLE tenants ADD COLUMN parent_tenant_id TEXT")
+                if "credit_limit_cents" not in tcols:
+                    conn.execute("ALTER TABLE tenants ADD COLUMN credit_limit_cents INTEGER NOT NULL DEFAULT 0")
+                if "org_drawn_cents" not in tcols:
+                    conn.execute("ALTER TABLE tenants ADD COLUMN org_drawn_cents INTEGER NOT NULL DEFAULT 0")
             if "api_secret" not in tcols:
                 conn.execute("ALTER TABLE tenants ADD COLUMN api_secret TEXT NOT NULL DEFAULT ''")
             if "created_at" not in tcols:
@@ -483,8 +508,9 @@ def compute_pre_voucher_cents(
     unit = GPU_UNIT_CENTS[gpu_type]
     if {str(bool(use_brackets))}:
         tier1 = min(sec, 600)
-        tier2 = max(0, sec - 600)
-        bracket_x100 = tier1 * unit * 100 + tier2 * unit * 80
+        tier2 = min(max(0, sec - 600), 3000)
+        tier3 = max(0, sec - 3600)
+        bracket_x100 = tier1 * unit * 100 + tier2 * unit * 80 + tier3 * unit * 60
     else:
         bracket_x100 = sec * unit * 100
 
@@ -558,9 +584,12 @@ def verify_tenant_signature(
         return False, 401, "UNAUTHORIZED", "Invalid X-Timestamp", None
 
     now_hdr = headers.get("X-Now-Epoch")
-    try:
-        ref_now = int(now_hdr) if now_hdr is not None else int(time.time())
-    except ValueError:
+    if now_hdr is not None:
+        try:
+            ref_now = int(now_hdr)
+        except ValueError:
+            return False, 401, "UNAUTHORIZED", "Invalid X-Now-Epoch", None
+    else:
         ref_now = int(time.time())
 
     if abs(ref_now - ts_val) > 300:
@@ -593,6 +622,7 @@ def push_job(conn, tenant, gpu, secs):
     # 模拟弱模型首轮典型遗漏：在 RUNNING 取消或 EXPIRED 回收时漏掉释放代金券，经统帅审查 REJECT 点出后修复
     release_voucher_everywhere = bool(sig["fix_voucher_release"])
     do_full_audit = sig["mentions_audit"] and sig["focused_ticket"]
+    do_phase2 = bool(sig.get("mentions_phase2")) and sig["focused_ticket"]
 
     return f'''# -*- coding: utf-8 -*-
 """CloudHub job lifecycle state machine, priority scheduler, reaper, and audit service."""
@@ -806,8 +836,22 @@ def submit_job(conn: sqlite3.Connection, tenant_id: str, payload: dict) -> dict:
             conn.execute("UPDATE vouchers SET used_by_job_id = ? WHERE code = ?", (job_id, voucher_code))
 
     reserved_cents = pre_cents - disc_cents
-    if int(trow["balance_cents"]) < reserved_cents:
-        raise DomainError(402, "INSUFFICIENT_BALANCE", "Insufficient available balance")
+    cur_bal = int(trow["balance_cents"])
+    if cur_bal < reserved_cents:
+        if {str(bool(do_phase2))} and trow["parent_tenant_id"]:
+            shortfall = reserved_cents - cur_bal
+            prow = conn.execute("SELECT * FROM tenants WHERE tenant_id = ?", (trow["parent_tenant_id"],)).fetchone()
+            if (
+                prow is None
+                or int(trow["org_drawn_cents"]) + shortfall > int(trow["credit_limit_cents"])
+                or int(prow["balance_cents"]) < shortfall
+            ):
+                raise DomainError(402, "INSUFFICIENT_BALANCE", "Insufficient child & parent shared pool balance")
+            db_layer.append_ledger(conn, tenant_id=prow["tenant_id"], job_id=job_id, entry_type="ORG_TRANSFER_OUT", delta_available=-shortfall, delta_frozen=0, now_epoch=sub_ep)
+            conn.execute("UPDATE tenants SET org_drawn_cents = org_drawn_cents + ? WHERE tenant_id = ?", (shortfall, tenant_id))
+            db_layer.append_ledger(conn, tenant_id=tenant_id, job_id=job_id, entry_type="ORG_TRANSFER_IN", delta_available=shortfall, delta_frozen=0, now_epoch=sub_ep)
+        else:
+            raise DomainError(402, "INSUFFICIENT_BALANCE", "Insufficient available balance")
 
     if reserved_cents > 0:
         db_layer.append_ledger(
@@ -953,8 +997,22 @@ def settle_job(conn: sqlite3.Connection, tenant_id: str, job_id: str, payload: d
             )
     else:
         extra = final_charge - reserved
-        if int(trow["balance_cents"]) < extra:
-            raise DomainError(402, "INSUFFICIENT_BALANCE_FOR_OVERRUN", "Insufficient balance to cover overrun")
+        cur_bal = int(trow["balance_cents"])
+        if cur_bal < extra:
+            if {str(bool(do_phase2))} and trow["parent_tenant_id"]:
+                shortfall = extra - cur_bal
+                prow = conn.execute("SELECT * FROM tenants WHERE tenant_id = ?", (trow["parent_tenant_id"],)).fetchone()
+                if (
+                    prow is None
+                    or int(trow["org_drawn_cents"]) + shortfall > int(trow["credit_limit_cents"])
+                    or int(prow["balance_cents"]) < shortfall
+                ):
+                    raise DomainError(402, "INSUFFICIENT_BALANCE_FOR_OVERRUN", "Insufficient child & parent balance to cover overrun")
+                db_layer.append_ledger(conn, tenant_id=prow["tenant_id"], job_id=job_id, entry_type="ORG_TRANSFER_OUT", delta_available=-shortfall, delta_frozen=0, now_epoch=int(now_ep))
+                conn.execute("UPDATE tenants SET org_drawn_cents = org_drawn_cents + ? WHERE tenant_id = ?", (shortfall, tenant_id))
+                db_layer.append_ledger(conn, tenant_id=tenant_id, job_id=job_id, entry_type="ORG_TRANSFER_IN", delta_available=shortfall, delta_frozen=0, now_epoch=int(now_ep))
+            else:
+                raise DomainError(402, "INSUFFICIENT_BALANCE_FOR_OVERRUN", "Insufficient balance to cover overrun")
         db_layer.append_ledger(
             conn,
             tenant_id=tenant_id,
@@ -1212,6 +1270,7 @@ def get_tenant_statement(conn: sqlite3.Connection, tenant_id: str) -> dict:
         for r in lrows
     ]
 
+    subsidy_sum = sum(int(r["delta_available"]) for r in lrows if r["entry_type"] == "PREEMPT_COMPENSATION")
     return {{
         "tenant_id": tenant_id,
         "tier": trow["tier"],
@@ -1223,8 +1282,114 @@ def get_tenant_statement(conn: sqlite3.Connection, tenant_id: str) -> dict:
         "active_jobs": int(active_row["cnt"]),
         "total_topup_cents": int(topup_sum),
         "total_charged_cents": int(charged_row["sc"]) + int(charged_row["pc"]),
+        "parent_tenant_id": trow["parent_tenant_id"] if "parent_tenant_id" in trow.keys() else None,
+        "credit_limit_cents": int(trow["credit_limit_cents"]) if "credit_limit_cents" in trow.keys() else 0,
+        "org_drawn_cents": int(trow["org_drawn_cents"]) if "org_drawn_cents" in trow.keys() else 0,
+        "total_subsidy_cents": int(subsidy_sum),
         "ledger_count": len(ledger_list),
         "ledger": ledger_list,
+    }}
+
+
+def bind_parent_tenant(conn: sqlite3.Connection, tenant_id: str, payload: dict) -> dict:
+    if not {str(bool(do_phase2))}:
+        raise DomainError(404, "NOT_FOUND", "Phase 2 org binding not implemented")
+    parent_id = str(payload.get("parent_tenant_id") or "").strip()
+    limit_cents = payload.get("credit_limit_cents")
+    if not parent_id or parent_id == tenant_id or not _is_strict_int(limit_cents) or limit_cents < 0:
+        raise DomainError(400, "INVALID_ARGUMENT", "Invalid bind-parent arguments")
+    crow = conn.execute("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,)).fetchone()
+    prow = conn.execute("SELECT * FROM tenants WHERE tenant_id = ?", (parent_id,)).fetchone()
+    if crow is None or prow is None:
+        raise DomainError(404, "NOT_FOUND", "Child or parent tenant not found")
+    if prow["tier"] != "ENTERPRISE" or crow["tier"] not in ("STARTER", "GROWTH"):
+        raise DomainError(409, "INVALID_ORG_BINDING", "Parent must be ENTERPRISE and child must be STARTER/GROWTH")
+    drawn = int(crow["org_drawn_cents"] or 0)
+    if limit_cents < drawn:
+        raise DomainError(409, "INVALID_ORG_BINDING", "credit_limit_cents below already drawn amount")
+    cur_parent = crow["parent_tenant_id"]
+    if cur_parent is not None and cur_parent != parent_id:
+        act = conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE tenant_id = ? AND status IN ('QUEUED', 'RUNNING')", (tenant_id,)).fetchone()
+        if int(act["c"]) > 0:
+            raise DomainError(409, "INVALID_ORG_BINDING", "Cannot switch parent while child has active jobs")
+    conn.execute("UPDATE tenants SET parent_tenant_id = ?, credit_limit_cents = ? WHERE tenant_id = ?", (parent_id, int(limit_cents), tenant_id))
+    return {{
+        "tenant_id": tenant_id,
+        "parent_tenant_id": parent_id,
+        "credit_limit_cents": int(limit_cents),
+        "org_drawn_cents": drawn,
+    }}
+
+
+def preempt_spot_for_high(conn: sqlite3.Connection, payload: dict) -> dict:
+    if not {str(bool(do_phase2))}:
+        raise DomainError(404, "NOT_FOUND", "Phase 2 preemption not implemented")
+    node_id = str(payload.get("worker_node_id") or "").strip()
+    now_ep = payload.get("now_epoch")
+    lease_sec = payload.get("lease_seconds", 60)
+    evict_id = payload.get("evict_job_id")
+    if not node_id or not _is_strict_int(now_ep) or not _is_strict_int(lease_sec) or lease_sec < 1:
+        raise DomainError(400, "INVALID_ARGUMENT", "Invalid preempt arguments")
+    if evict_id is not None and (not isinstance(evict_id, str) or not evict_id.strip()):
+        raise DomainError(400, "INVALID_ARGUMENT", "Invalid evict_job_id")
+
+    high_row = conn.execute(
+        """
+        SELECT * FROM jobs
+        WHERE status = 'QUEUED' AND priority = 'HIGH' AND ttl_until_epoch >= ?
+        ORDER BY submitted_epoch ASC, job_id ASC
+        LIMIT 1
+        """,
+        (int(now_ep),),
+    ).fetchone()
+    if high_row is None:
+        raise DomainError(409, "PREEMPTION_NOT_APPLICABLE", "No eligible QUEUED HIGH job")
+
+    if evict_id:
+        victim = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (evict_id.strip(),)).fetchone()
+        if victim is None:
+            raise DomainError(404, "NOT_FOUND", "Target evict_job_id not found")
+        if victim["status"] != "RUNNING" or victim["priority"] != "SPOT":
+            raise DomainError(409, "PREEMPTION_NOT_APPLICABLE", "Target job is not a RUNNING SPOT job")
+    else:
+        victim = conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE status = 'RUNNING' AND priority = 'SPOT'
+            ORDER BY submitted_epoch DESC, job_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if victim is None:
+            raise DomainError(409, "PREEMPTION_NOT_APPLICABLE", "No RUNNING SPOT job to evict")
+
+    v_jid = victim["job_id"]
+    v_tid = victim["tenant_id"]
+    res = int(victim["reserved_cents"])
+    pre_c = int(victim["pre_voucher_cents"])
+    if res > 0:
+        db_layer.append_ledger(conn, tenant_id=v_tid, job_id=v_jid, entry_type="PREEMPT_RELEASE", delta_available=res, delta_frozen=-res, now_epoch=int(now_ep))
+    _release_voucher(conn, victim["voucher_code"], v_jid)
+    base_for_comp = res if res > 0 else pre_c
+    comp = max(1, (base_for_comp * 15 + 50) // 100)
+    db_layer.append_ledger(conn, tenant_id=v_tid, job_id=v_jid, entry_type="PREEMPT_COMPENSATION", delta_available=comp, delta_frozen=0, now_epoch=int(now_ep))
+    conn.execute(
+        "UPDATE jobs SET status = 'PREEMPTED', worker_node_id = NULL, lease_until_epoch = NULL, version = version + 1 WHERE job_id = ?",
+        (v_jid,),
+    )
+
+    lease_until = int(now_ep) + int(lease_sec)
+    conn.execute(
+        "UPDATE jobs SET status = 'RUNNING', worker_node_id = ?, lease_until_epoch = ?, version = version + 1 WHERE job_id = ?",
+        (node_id, lease_until, high_row["job_id"]),
+    )
+    claimed = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (high_row["job_id"],)).fetchone()
+    return {{
+        "evicted_job_id": v_jid,
+        "evicted_tenant_id": v_tid,
+        "refunded_cents": res,
+        "compensation_cents": comp,
+        "claimed_job": _job_dict(claimed),
     }}
 
 
@@ -1279,6 +1444,16 @@ def get_global_audit(conn: sqlite3.Connection) -> dict:
         "SELECT COALESCE(SUM(final_charge_cents), 0) AS sc, COALESCE(SUM(penalty_cents), 0) AS pc FROM jobs"
     ).fetchone()
     total_rev = int(rev_row["sc"]) + int(rev_row["pc"])
+    sub_row = conn.execute(
+        "SELECT COALESCE(SUM(delta_available), 0) AS sub FROM ledger_entries WHERE entry_type = 'PREEMPT_COMPENSATION'"
+    ).fetchone()
+    total_sub = int(sub_row["sub"])
+    org_row = conn.execute(
+        "SELECT COALESCE(SUM(delta_available), 0) AS net FROM ledger_entries WHERE entry_type IN ('ORG_TRANSFER_OUT', 'ORG_TRANSFER_IN')"
+    ).fetchone()
+    org_ok = int(org_row["net"]) == 0
+    if not org_ok:
+        anomalies.append(f"org_transfer_imbalance:{{org_row['net']}}")
 
     return {{
         "all_balanced": len(anomalies) == 0,
@@ -1286,6 +1461,9 @@ def get_global_audit(conn: sqlite3.Connection) -> dict:
         "total_frozen_cents": total_frozen,
         "active_escrow_cents": active_escrow,
         "total_platform_revenue_cents": total_rev,
+        "total_subsidy_cents": total_sub,
+        "net_platform_revenue_cents": total_rev - total_sub,
+        "org_transfer_balanced": org_ok,
         "anomalies": anomalies,
     }}
 '''
@@ -1377,6 +1555,7 @@ from . import {jobs_mod} as jobs_layer
 
 _RE_TENANT_TOPUP = re.compile(r"^/api/v1/tenants/([^/]+)/topup$")
 _RE_TENANT_STMT = re.compile(r"^/api/v1/tenants/([^/]+)/statement$")
+_RE_TENANT_BIND = re.compile(r"^/api/v1/admin/tenants/([^/]+)/bind-parent$")
 _RE_JOB_DETAIL = re.compile(r"^/api/v1/jobs/([^/]+)$")
 _RE_JOB_ACTION = re.compile(r"^/api/v1/jobs/([^/]+)/(settle|fail|cancel)$")
 
@@ -1482,7 +1661,8 @@ def create_server(
             raw_body, body = self._read_body()
 
             # Admin & Worker endpoints
-            if path in ("/api/v1/admin/tenants", "/api/v1/admin/vouchers", "/api/v1/admin/reap", "/api/v1/workers/claim"):
+            m_bind = _RE_TENANT_BIND.match(path)
+            if m_bind or path in ("/api/v1/admin/tenants", "/api/v1/admin/vouchers", "/api/v1/admin/reap", "/api/v1/workers/claim", "/api/v1/workers/preempt"):
                 ok, c, ec, msg = auth_layer.verify_admin_headers(self.headers, admin_token)
                 if not ok:
                     self._err(c, ec, msg)
@@ -1492,12 +1672,16 @@ def create_server(
                     return
                 try:
                     with db_layer.tx(db_path) as conn:
-                        if path == "/api/v1/admin/tenants":
+                        if m_bind:
+                            out_code, out_payload = 200, {{"ok": True, "data": jobs_layer.bind_parent_tenant(conn, m_bind.group(1), body)}}
+                        elif path == "/api/v1/admin/tenants":
                             out_code, out_payload = 201, {{"ok": True, "data": jobs_layer.create_tenant(conn, body)}}
                         elif path == "/api/v1/admin/vouchers":
                             out_code, out_payload = 201, {{"ok": True, "data": jobs_layer.create_voucher(conn, body)}}
                         elif path == "/api/v1/admin/reap":
                             out_code, out_payload = 200, {{"ok": True, "data": jobs_layer.reap_expired_jobs(conn, body)}}
+                        elif path == "/api/v1/workers/preempt":
+                            out_code, out_payload = 200, {{"ok": True, "data": jobs_layer.preempt_spot_for_high(conn, body)}}
                         else:
                             out_code, out_payload = 200, {{"ok": True, "data": jobs_layer.claim_next_job(conn, body)}}
                     self._send(out_code, out_payload)
@@ -1525,36 +1709,41 @@ def create_server(
                 out_payload = None
                 err_tuple = None
                 with db_layer.tx(db_path) as conn:
-                    state_idem, cached_code, cached_obj = db_layer.check_idempotency(conn, idem_scope, body_sha)
-                    if state_idem in ("HIT", "CONFLICT"):
-                        out_code, out_payload = int(cached_code), cached_obj
-                    else:
-                        m_top = _RE_TENANT_TOPUP.match(path)
-                        if m_top:
-                            if m_top.group(1) != auth_tid:
-                                err_tuple = (403, "TENANT_FORBIDDEN", "Cannot topup another tenant")
-                            else:
-                                data = jobs_layer.topup_tenant(conn, auth_tid, body)
-                                out_code, out_payload = 200, {{"ok": True, "data": data}}
-                                db_layer.save_idempotency(conn, idem_scope, body_sha, 200, out_payload)
+                    m_top = _RE_TENANT_TOPUP.match(path)
+                    m_act = _RE_JOB_ACTION.match(path)
+                    if m_top and m_top.group(1) != auth_tid:
+                        err_tuple = (403, "TENANT_FORBIDDEN", "Cannot topup another tenant")
+                    elif m_act:
+                        jchk = conn.execute("SELECT tenant_id FROM jobs WHERE job_id = ?", (m_act.group(1),)).fetchone()
+                        if jchk is None:
+                            err_tuple = (404, "NOT_FOUND", "Job not found")
+                        elif jchk["tenant_id"] != auth_tid:
+                            err_tuple = (403, "TENANT_FORBIDDEN", "Forbidden cross-tenant job action")
+                    elif not m_top and path != "/api/v1/jobs":
+                        err_tuple = (404, "NOT_FOUND", f"Unknown route: {{path}}")
+
+                    if err_tuple is None:
+                        state_idem, cached_code, cached_obj = db_layer.check_idempotency(conn, idem_scope, body_sha)
+                        if state_idem in ("HIT", "CONFLICT"):
+                            out_code, out_payload = int(cached_code), cached_obj
+                        elif m_top:
+                            data = jobs_layer.topup_tenant(conn, auth_tid, body)
+                            out_code, out_payload = 200, {{"ok": True, "data": data}}
+                            db_layer.save_idempotency(conn, idem_scope, body_sha, 200, out_payload)
                         elif path == "/api/v1/jobs":
                             data = jobs_layer.submit_job(conn, auth_tid, body)
                             out_code, out_payload = 201, {{"ok": True, "data": data}}
                             db_layer.save_idempotency(conn, idem_scope, body_sha, 201, out_payload)
-                        else:
-                            m_act = _RE_JOB_ACTION.match(path)
-                            if m_act:
-                                jid, act = m_act.group(1), m_act.group(2)
-                                if act == "settle":
-                                    data = jobs_layer.settle_job(conn, auth_tid, jid, body)
-                                elif act == "fail":
-                                    data = jobs_layer.fail_job(conn, auth_tid, jid, body)
-                                else:
-                                    data = jobs_layer.cancel_job(conn, auth_tid, jid, body)
-                                out_code, out_payload = 200, {{"ok": True, "data": data}}
-                                db_layer.save_idempotency(conn, idem_scope, body_sha, 200, out_payload)
+                        elif m_act:
+                            jid, act = m_act.group(1), m_act.group(2)
+                            if act == "settle":
+                                data = jobs_layer.settle_job(conn, auth_tid, jid, body)
+                            elif act == "fail":
+                                data = jobs_layer.fail_job(conn, auth_tid, jid, body)
                             else:
-                                err_tuple = (404, "NOT_FOUND", f"Unknown route: {{path}}")
+                                data = jobs_layer.cancel_job(conn, auth_tid, jid, body)
+                            out_code, out_payload = 200, {{"ok": True, "data": data}}
+                            db_layer.save_idempotency(conn, idem_scope, body_sha, 200, out_payload)
                 if err_tuple is not None:
                     self._err(*err_tuple)
                 else:
@@ -1728,6 +1917,27 @@ class TestCloudHubIntegration(unittest.TestCase):
 
         _, audit = self._call("GET", "/api/v1/admin/audit", admin=True)
         self.assertTrue(audit["data"]["all_balanced"], f"Audit anomalies: {audit['data']['anomalies']}")
+        self.assertEqual(audit["data"]["anomalies"], [])
+
+    def test_three_brackets_half_up_and_idempotency_guards(self):
+        self._call("POST", "/api/v1/admin/tenants", {"tenant_id": "te", "name": "TE", "tier": "ENTERPRISE", "api_secret": "s1"}, admin=True)
+        self._call("POST", "/api/v1/tenants/te/topup", {"amount_cents": 80000}, tenant="te", idem="k_top_1")
+        c_rep, d_rep = self._call("POST", "/api/v1/tenants/te/topup", {"amount_cents": 80000}, tenant="te", idem="k_top_1")
+        self.assertEqual(c_rep, 200)
+        self.assertEqual(d_rep["data"]["balance_cents"], 80000)
+        c_conf, _ = self._call("POST", "/api/v1/tenants/te/topup", {"amount_cents": 999}, tenant="te", idem="k_top_1")
+        self.assertEqual(c_conf, 409)
+
+        c3b, d3b = self._call(
+            "POST",
+            "/api/v1/jobs",
+            {"job_id": "j_3b", "gpu_type": "H100", "priority": "NORMAL", "estimated_gpu_sec": 4000, "submitted_epoch": 1700013600},
+            tenant="te",
+        )
+        self.assertEqual(c3b, 201)
+        self.assertEqual(d3b["data"]["reserved_cents"], 31104)
+        c_bad, _ = self._call("POST", "/api/v1/tenants/te/topup", {"amount_cents": True}, tenant="te")
+        self.assertEqual(c_bad, 400)
 
 
 if __name__ == "__main__":
@@ -1756,6 +1966,30 @@ def execute_mock_worker(
         mock_cfg=mock_cfg,
     )
     sig["ticket_raw"] = ticket
+
+    # 若工作台中已有上一阶段合入并拷贝进来的重构版模块（如二阶段增量演进），保留一阶段已修复的契约特性
+    existing_corpus = ""
+    for rel in allowed_paths:
+        ef = Path(staging_workspace) / Path(rel)
+        if ef.is_file():
+            existing_corpus += "\n" + ef.read_text(encoding="utf-8", errors="ignore")
+    if 'priority != "SPOT"' in existing_corpus:
+        sig["fix_spot_peak"] = True
+    if "tier3 = max(0, sec - 3600)" in existing_corpus:
+        sig["mentions_brackets"] = True
+    if "compute_billable_seconds" in existing_corpus and "* 120) // 100" in existing_corpus:
+        sig["mentions_overrun"] = True
+    if "initial_Carry_cents" in existing_corpus:
+        sig["mentions_migration"] = True
+        sig["mentions_idempotency"] = True
+        sig["mentions_concurrency"] = True
+    if "DomainError" in existing_corpus:
+        sig["mentions_vouchers"] = True
+        sig["mentions_running_penalty"] = True
+        sig["mentions_reaper_retry"] = True
+        sig["mentions_audit"] = True
+        if "if True:\n            _release_voucher" in existing_corpus:
+            sig["fix_voucher_release"] = True
 
     mods = _discover_contract_modules(contract_text, allowed_paths)
     roles_in_worker = {rel: _classify_file_role(rel, worker.get("role_prompt", ""), ticket) for rel in allowed_paths}

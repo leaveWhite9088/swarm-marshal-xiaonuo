@@ -46,7 +46,12 @@ ENV_COMMIT_FILES = (
 TASK_COMMIT_FILES = (
     "src/sandbox_template/TASK.md",
     "src/sandbox_template/smoke_public.py",
+    "src/sandbox_template/cloudhub/db.py",
+    "src/sandbox_template/cloudhub/billing.py",
+    "src/sandbox_template/cloudhub/jobs.py",
+    "src/sandbox_template/cloudhub/auth.py",
     "src/sandbox_template/cloudhub/app.py",
+    "src/marshal/phase2_spec.py",
 )
 
 
@@ -89,28 +94,39 @@ def compute_worker_config_commit(config: dict, worker_mode: str) -> str:
 def _build_marshal_desk_guide(model_name: str) -> str:
     return f"""# 统帅案头作战速查卡（`{model_name}`）
 
-- **项目需求说明书**：同目录下的 `TASK.md`（18 条耦合规则与 HTTP 契约）
+- **一阶段需求说明书**：同目录下的 `TASK.md`（存量半成品排雷重构规范与路由契约）
+- **二阶段紧急演进书**：完成一阶段合入后执行 `unlock_phase2` 动态生成 `PHASE2_TASK.md`
 - **收尾统领复盘表**：同目录下的 `RETROSPECTIVE.md`（收工打包前必须如实填写）
-- **主干业务沙盒**：`../workspace/`（**物理禁手保护**：统帅严禁直接写 `workspace/` 内任何文件，一切代码改动必须经下属工位提交并通过 `APPROVE` 合入！）
+- **主干业务沙盒**：`../workspace/`（**物理禁手保护**：严禁直接写 `workspace/` 内任何文件，一切改动必须经下属工位提交并 `APPROVE` 合入！）
 
-## 五大统帅命令速查（在仓库根目录执行）
+## 核心编制与字数硬约束
+- **工位上限**：最多 **3 个**工位，每个工位最多绑定 **3 个 `.py` 文件**（禁止单工位全包 5 个模块）
+- **派单预算**：全局最多 **15 单**（单工位最多唤醒 **6 次**，同一工单链最多打回返工 **2 次**即熔断）
+- **精炼度上限**：全局契约 `<= 5500` 字符，单张工单 `<= 2000` 字符，岗位提示词 `<= 1200` 字符
 
-1. **立全局规矩（`define_contract`）**——必须在首张派单前一次立稳（派单中途改契约将触发重罚！）：
+## 统帅核心命令速查（在仓库根目录执行）
+
+0. **勘探存量半成品暗雷（强烈建议立契约前先读存量源码！）**：
+   `python tools/marshal.py --model "{model_name}" inspect_and_test --target trunk`
+   `python tools/marshal.py --model "{model_name}" inspect_and_test --target trunk --path cloudhub/db.py`
+1. **立全局规矩（`define_contract`）**——首张派单前一次立稳（`<= 5500` 字符）：
    `python tools/marshal.py --model "{model_name}" define_contract --file draft/contract.md`
-2. **搭班子与划领地（`manage_worker`）**——最多 5 个工位，单工位最多绑定 4 个 `.py` 文件：
-   `python tools/marshal.py --model "{model_name}" manage_worker --worker-id db_worker --allowed-paths cloudhub/db.py --role-prompt "专注 SQLite 持久层、v1 在线迁表、幂等表与双本位流水"`
-3. **拆单派活（`dispatch_task`）**——全局紧预算上限 14 单（单工位最多 5 次唤醒，单工单最多允许打回返工 2 次即熔断），严禁在工单内夹带现成 Python 实现代码块：
-   `python tools/marshal.py --model "{model_name}" dispatch_task --worker-id db_worker --ticket-file draft/ticket.md`
-4. **查代码与跑自检（`inspect_and_test`）**——支持对暂存提交做预合入叠加测试：
+2. **搭班子与划领地（`manage_worker`）**——最多 3 个工位，单工位最多 3 个 `.py` 文件：
+   `python tools/marshal.py --model "{model_name}" manage_worker --worker-id core_data --allowed-paths cloudhub/db.py cloudhub/billing.py --role-file draft/role_data.md`
+3. **拆单派活（`dispatch_task` / `dispatch_parallel`）**——单单 `<= 2000` 字符，严禁夹带现成业务源码；支持单工位派单或同波次多工位并行派单：
+   `python tools/marshal.py --model "{model_name}" dispatch_task --worker-id core_data --ticket-file draft/ticket_1.md`
+   `python tools/marshal.py --model "{model_name}" dispatch_parallel --tasks core_data:draft/ticket_1.md api_gateway:draft/ticket_2.md`
+4. **查代码与跑自检（`inspect_and_test`）**——每次裁决前务必先看暂存 Diff 或跑叠加测试：
    `python tools/marshal.py --model "{model_name}" inspect_and_test --target staging --submission-id sub_001`
-   `python tools/marshal.py --model "{model_name}" inspect_and_test --target smoke --submission-id sub_001`
-   `python tools/marshal.py --model "{model_name}" inspect_and_test --target unittest --submission-id sub_005`
+   `python tools/marshal.py --model "{model_name}" inspect_and_test --target unittest --submission-id sub_003`
 5. **拍板合入或打回重做（`review_submission`）**：
-   `python tools/marshal.py --model "{model_name}" review_submission --submission-id sub_001 --decision APPROVE --comment "签名与事务锁符合全局契约"`
-   `python tools/marshal.py --model "{model_name}" review_submission --submission-id sub_002 --decision REJECT --comment "指出具体错误行与缺失边界，触发原工位返工"`
+   `python tools/marshal.py --model "{model_name}" review_submission --submission-id sub_001 --decision APPROVE --comment "说明已核验通过的边界点"`
+   `python tools/marshal.py --model "{model_name}" review_submission --submission-id sub_002 --decision REJECT --comment-file draft/fix.md`
+6. **解锁第二阶段紧急演进需求（`unlock_phase2`）**——一阶段合入稳妥后调用，解锁 `briefing/PHASE2_TASK.md` 并获赠 1 次免费契约升级额度：
+   `python tools/marshal.py --model "{model_name}" unlock_phase2`
 
 ## 收尾打包（严禁运行 `score_run.py` 或 `finalize.py`）
-1. 填写 `runs/{model_name}/briefing/RETROSPECTIVE.md`（并按需填写 `runs/{model_name}/token_usage.json`），清空 `draft/`；
+1. 跑通全套一、二阶段集成自测，如实填写 `runs/{model_name}/briefing/RETROSPECTIVE.md`，彻底清空 `draft/`；
 2. 执行 `python src/scoring/judge_pack.py --model "{model_name}"` 冻结 `t1` 并导出匿名盲评包。
 """
 

@@ -2,13 +2,15 @@
 """统帅调度状态存储、隔离暂存区编排、Diff 提取与防篡改链式轨迹日志（state_store.py）。"""
 from __future__ import annotations
 
+import contextlib
 import datetime
 import difflib
 import hashlib
 import json
+import os
 import shutil
 import stat
-import os
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +21,10 @@ from .guardrails import (
     set_workspace_writable,
     verify_workspace_integrity,
 )
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def now_iso() -> str:
@@ -85,6 +91,8 @@ class MarshalStateStore:
         self.transcripts_root = self.state_dir / "worker_transcripts"
         self.results_root = self.state_dir / "worker_results"
         self.trace_path = self.run_dir / "trace.jsonl"
+        self._proc_lock = threading.RLock()
+        self._tls = threading.local()
 
     def initialize(self, model_name: str, worker_mode: str, config: dict) -> dict:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -96,10 +104,14 @@ class MarshalStateStore:
 
         trunk_manifest = compute_workspace_manifest(self.workspace_dir)
         state = {
-            "schema_version": 1,
+            "schema_version": 2,
             "model": model_name,
             "worker_mode": worker_mode,
             "created_at": now_iso(),
+            "phase": 1,
+            "phase2_unlocked": False,
+            "phase2_unlocked_at_dispatch": None,
+            "phase2_free_contract_credit": 0,
             "contract_version": 0,
             "contract_chars": 0,
             "contract_defined_before_first_dispatch": None,
@@ -108,7 +120,7 @@ class MarshalStateStore:
             "submissions": {},
             "next_submission_seq": 1,
             "dispatches_used": 0,
-            "max_dispatches": int((config.get("marshal_limits") or {}).get("max_dispatches", 14)),
+            "max_dispatches": int((config.get("marshal_limits") or {}).get("max_dispatches", 15)),
             "code_smuggling_count": 0,
             "tool_error_count": 0,
             "tamper_detected": False,
@@ -141,30 +153,132 @@ class MarshalStateStore:
 
     def save_state(self, state: dict) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_file.with_suffix(".tmp")
+        tmp = self.state_file.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.state_file)
 
+    @contextlib.contextmanager
+    def state_lock(self, timeout_sec: float = 30.0):
+        """跨进程 + 进程内多线程可重入互斥锁，保障多工位并发派单与状态账本零踩踏。"""
+        with self._proc_lock:
+            depth = getattr(self._tls, "depth", 0)
+            if depth > 0:
+                self._tls.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._tls.depth = depth
+                return
+
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = self.state_dir / ".state.lock"
+            deadline = time.monotonic() + timeout_sec
+            fd = None
+            while True:
+                try:
+                    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.write(fd, f"{os.getpid()}:{time.time()}".encode("ascii"))
+                    break
+                except FileExistsError:
+                    try:
+                        if time.time() - lock_path.stat().st_mtime > 45.0:
+                            lock_path.unlink(missing_ok=True)
+                            continue
+                    except OSError:
+                        pass
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.02)
+            self._tls.depth = 1
+            try:
+                yield
+            finally:
+                self._tls.depth = 0
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    try:
+                        lock_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+    def _read_trace_tail(self) -> tuple[int, str]:
+        if not self.trace_path.is_file():
+            return 0, "GENESIS"
+        lines = [ln for ln in self.trace_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if not lines:
+            return 0, "GENESIS"
+        last = json.loads(lines[-1])
+        return int(last.get("seq", len(lines))), str(last.get("entry_hash", "GENESIS"))
+
     def append_trace(self, state: dict, *, event_type: str, action: str, payload: dict) -> dict:
-        seq = int(state.get("trace_seq", 0)) + 1
-        prev_hash = str(state.get("last_trace_hash", "GENESIS"))
-        rec_body = {
-            "seq": seq,
-            "t": int(time.time() * 1000),
-            "ts": now_iso(),
-            "type": event_type,
-            "action": action,
-            "payload": payload,
-            "prev_hash": prev_hash,
-        }
-        entry_hash = compute_trace_entry_hash(prev_hash, rec_body)
-        rec = {**rec_body, "entry_hash": entry_hash}
-        with self.trace_path.open("a", encoding="utf-8", newline="\n") as f:
-            f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
-        state["trace_seq"] = seq
-        state["last_trace_hash"] = entry_hash
-        self.save_state(state)
-        return rec
+        with self.state_lock():
+            tail_seq, tail_hash = self._read_trace_tail()
+            seq = tail_seq + 1
+            prev_hash = tail_hash
+            rec_body = {
+                "seq": seq,
+                "t": int(time.time() * 1000),
+                "ts": now_iso(),
+                "type": event_type,
+                "action": action,
+                "payload": payload,
+                "prev_hash": prev_hash,
+            }
+            entry_hash = compute_trace_entry_hash(prev_hash, rec_body)
+            rec = {**rec_body, "entry_hash": entry_hash}
+            with self.trace_path.open("a", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+            state["trace_seq"] = seq
+            state["last_trace_hash"] = entry_hash
+            self.save_state(state)
+            return rec
+
+    def restore_trunk_from_history(self, state: dict) -> list[str]:
+        """若底层工人执行窗口内主干文件被意外触碰，依据已批准账本与提交快照自动自愈回滚。"""
+        manifest = state.get("trunk_manifest") or {}
+        ok, anomalies = verify_workspace_integrity(self.workspace_dir, manifest)
+        if ok:
+            return []
+        tpl_dir = self.repo_root / "src" / "sandbox_template"
+        subs = state.get("submissions") or {}
+        approved_subs = [
+            s for s in subs.values() if s.get("status") == "APPROVED"
+        ]
+        set_workspace_writable(self.workspace_dir, True)
+        try:
+            # 1) 清理账本外多余的非忽略文件
+            for p in list(self.workspace_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(self.workspace_dir).as_posix()
+                if is_ignored_workspace_file(rel):
+                    continue
+                if rel not in manifest:
+                    p.unlink(missing_ok=True)
+            # 2) 按账本哈希恢复缺失或被改写的文件
+            for rel, expected_sha in manifest.items():
+                dst = self.workspace_dir / Path(rel)
+                if dst.is_file() and _sha256_file(dst) == expected_sha:
+                    continue
+                if rel == "PHASE2_TASK.md" and (self.briefing_dir / "PHASE2_TASK.md").is_file():
+                    b_p2 = self.briefing_dir / "PHASE2_TASK.md"
+                    if _sha256_file(b_p2) == expected_sha:
+                        shutil.copy2(b_p2, dst)
+                        continue
+                candidates: list[Path] = [tpl_dir / Path(rel)]
+                for s in reversed(approved_subs):
+                    candidates.insert(0, self.submissions_root / s["submission_id"] / "files" / Path(rel))
+                for cand in candidates:
+                    if cand.is_file() and _sha256_file(cand) == expected_sha:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(cand, dst)
+                        break
+        finally:
+            set_workspace_writable(self.workspace_dir, False)
+        return anomalies
 
     def check_and_record_tamper(self, state: dict) -> tuple[bool, list[str]]:
         """每次工具动作前后校验主干业务目录是否被统帅绕过调度器手工直写。"""
@@ -195,16 +309,50 @@ class MarshalStateStore:
         state["contract_version"] = int(state.get("contract_version", 0)) + 1
         state["contract_chars"] = len(content.strip())
         midflight = int(state.get("dispatches_used", 0)) > 0
+        used_phase2_credit = False
         if midflight:
-            state["contract_revisions_after_dispatch"] = int(state.get("contract_revisions_after_dispatch", 0)) + 1
+            if int(state.get("phase2_free_contract_credit", 0)) > 0:
+                state["phase2_free_contract_credit"] = int(state.get("phase2_free_contract_credit", 0)) - 1
+                used_phase2_credit = True
+            else:
+                state["contract_revisions_after_dispatch"] = int(state.get("contract_revisions_after_dispatch", 0)) + 1
         elif state.get("contract_defined_before_first_dispatch") is None:
             state["contract_defined_before_first_dispatch"] = True
         self.save_state(state)
         return {
             "contract_version": state["contract_version"],
             "contract_chars": state["contract_chars"],
-            "midflight_revision": midflight,
+            "midflight_revision": midflight and (not used_phase2_credit),
+            "used_phase2_evolution_credit": used_phase2_credit,
             "contract_revisions_after_dispatch": int(state.get("contract_revisions_after_dispatch", 0)),
+        }
+
+    def unlock_phase2_in_store(self, state: dict, phase2_markdown: str) -> dict:
+        text = phase2_markdown.strip() + "\n"
+        self.briefing_dir.mkdir(parents=True, exist_ok=True)
+        (self.briefing_dir / "PHASE2_TASK.md").write_text(text, encoding="utf-8")
+
+        set_workspace_writable(self.workspace_dir, True)
+        try:
+            (self.workspace_dir / "PHASE2_TASK.md").write_text(text, encoding="utf-8")
+        finally:
+            set_workspace_writable(self.workspace_dir, False)
+
+        new_manifest = compute_workspace_manifest(self.workspace_dir)
+        state["trunk_manifest"] = new_manifest
+        state["trunk_digest"] = compute_manifest_digest(new_manifest)
+        state["phase"] = 2
+        state["phase2_unlocked"] = True
+        state["phase2_unlocked_at_dispatch"] = int(state.get("dispatches_used", 0))
+        state["phase2_free_contract_credit"] = 1
+        self.save_state(state)
+        return {
+            "phase": 2,
+            "phase2_unlocked": True,
+            "briefing_phase2_path": str(self.briefing_dir / "PHASE2_TASK.md"),
+            "phase2_unlocked_at_dispatch": state["phase2_unlocked_at_dispatch"],
+            "phase2_free_contract_credit": 1,
+            "trunk_digest": state["trunk_digest"],
         }
 
     def prepare_worker_staging(
@@ -280,6 +428,9 @@ class MarshalStateStore:
         ticket: str,
         driver_result: dict,
         rework_of: str | None = None,
+        started_ms: int | None = None,
+        finished_ms: int | None = None,
+        base_hashes_override: dict[str, str | None] | None = None,
     ) -> dict:
         """提取工位执行后的白名单文件快照、过滤越界文件、生成相对主干的 Unified Diff 并检查语法。"""
         wid = worker["worker_id"]
@@ -343,7 +494,11 @@ class MarshalStateStore:
         (sub_dir / "diff.patch").write_text(full_diff + ("\n" if full_diff else ""), encoding="utf-8")
 
         trunk_manifest = state.get("trunk_manifest") or {}
-        base_hashes = {rel: trunk_manifest.get(rel) for rel in worker["allowed_paths"]}
+        base_hashes = (
+            dict(base_hashes_override)
+            if base_hashes_override is not None
+            else {rel: trunk_manifest.get(rel) for rel in worker["allowed_paths"]}
+        )
 
         parent_sub = (state.get("submissions") or {}).get(rework_of) if rework_of else None
         rework_depth = (int(parent_sub.get("rework_depth", 0)) + 1) if parent_sub else 0
@@ -351,7 +506,10 @@ class MarshalStateStore:
         sub_meta = {
             "submission_id": sub_id,
             "worker_id": wid,
+            "phase": int(state.get("phase", 1)),
             "created_at": now_iso(),
+            "started_ms": started_ms,
+            "finished_ms": finished_ms,
             "rework_of": rework_of,
             "rework_depth": rework_depth,
             "status": "PENDING",
