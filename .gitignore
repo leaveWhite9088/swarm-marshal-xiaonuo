@@ -10,6 +10,7 @@ __pycache__/
 node_modules/
 
 # 运行过程数据与临时草稿不入库
+.archive_v1/
 runs/*
 !runs/.gitkeep
 draft/

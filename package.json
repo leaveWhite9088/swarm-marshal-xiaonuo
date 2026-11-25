@@ -1,9 +1,9 @@
 {
   "name": "swarm-marshal-xiaonuo",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "群智统帅 · 架构拆解与团队统领基准（Swarm Marshal Benchmark · xiaonuo-v1.0）",
+  "description": "群智统帅 · 架构拆解与团队统领基准（Swarm Marshal Benchmark · xiaonuo-v2.0）",
   "scripts": {
     "check:js": "node --check src/marshal/speclock_harness/pi_worker_runner.mjs && node --check src/marshal/speclock_harness/core/pi/rpc.mjs && node --check src/marshal/speclock_harness/core/pi/models.mjs",
     "smoke": "pwsh tests/smoke.ps1"

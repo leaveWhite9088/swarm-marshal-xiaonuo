@@ -11,10 +11,12 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -23,6 +25,20 @@ import urllib.request
 from pathlib import Path
 
 from .mock_worker import execute_mock_worker
+
+
+def _force_rmtree(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def _onerror(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            func(p)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onerror=_onerror)
 
 
 def build_worker_prompt(
@@ -81,14 +97,46 @@ def _run_pi_harness(
         raise RuntimeError("未找到 node 可执行文件，无法启动 pi harness。")
 
     timeout_sec = int(pi_cfg.get("timeout_sec", 240))
+    wid = worker["worker_id"]
+    stage_key = hashlib.sha256(str(staging_workspace.resolve()).encode("utf-8")).hexdigest()[:16]
+    box_root = Path(tempfile.gettempdir()) / "swarm_marshal_pi_boxes" / stage_key
+    box_ws = box_root / "workspace"
+    box_sess = box_root / "session"
+    box_transcripts = box_root / "transcripts"
+    box_results = box_root / "results"
+    box_prompt = box_root / "worker_system_prompt.md"
+
+    _force_rmtree(box_root)
+    box_root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(staging_workspace, box_ws)
+    for p in box_ws.rglob("*"):
+        if p.is_file():
+            try:
+                if p.name == "GLOBAL_CONTRACT.md":
+                    os.chmod(p, stat.S_IREAD)
+                else:
+                    os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+
+    box_sess.mkdir(parents=True, exist_ok=True)
+    if session_dir.is_dir():
+        for sf in session_dir.glob("*.jsonl"):
+            if sf.is_file():
+                shutil.copy2(sf, box_sess / sf.name)
+
+    box_transcripts.mkdir(parents=True, exist_ok=True)
+    box_results.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(system_prompt_file, box_prompt)
+
     spec = {
-        "workerId": worker["worker_id"],
+        "workerId": wid,
         "jobId": job_id,
-        "cwd": str(staging_workspace),
-        "sessionDir": str(session_dir),
-        "transcriptsDir": str(transcripts_dir),
-        "resultsDir": str(results_dir),
-        "systemPromptFile": str(system_prompt_file),
+        "cwd": str(box_ws),
+        "sessionDir": str(box_sess),
+        "transcriptsDir": str(box_transcripts),
+        "resultsDir": str(box_results),
+        "systemPromptFile": str(box_prompt),
         "provider": pi_cfg.get("provider", "deepseek"),
         "model": pi_cfg.get("model", "DeepSeek-V4.1-Flash-1017"),
         "thinking": pi_cfg.get("thinking", "off"),
@@ -105,26 +153,48 @@ def _run_pi_harness(
         "prompt": prompt_text,
     }
 
-    with tempfile.TemporaryDirectory(prefix="swarm_pi_io_") as io_tmp:
-        in_path = Path(io_tmp) / "input.json"
-        out_path = Path(io_tmp) / "output.json"
-        in_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        with tempfile.TemporaryDirectory(prefix="swarm_pi_io_", ignore_cleanup_errors=True) as io_tmp:
+            in_path = Path(io_tmp) / "input.json"
+            out_path = Path(io_tmp) / "output.json"
+            in_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        proc = subprocess.run(
-            [node_bin, str(runner_mjs), "--input", str(in_path), "--output", str(out_path)],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_sec + 30,
-        )
-        if out_path.is_file():
-            res = json.loads(out_path.read_text(encoding="utf-8"))
-            if not res.get("ok"):
-                raise RuntimeError(f"pi 工人执行失败: {res.get('error') or proc.stderr[-500:]}")
-            return res
-        raise RuntimeError(f"pi_worker_runner 未生成结果文件 (code={proc.returncode}): {proc.stderr[-600:]}")
+            proc = subprocess.run(
+                [node_bin, str(runner_mjs), "--input", str(in_path), "--output", str(out_path)],
+                cwd=str(box_ws),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec + 30,
+            )
+            if out_path.is_file():
+                res = json.loads(out_path.read_text(encoding="utf-8"))
+                if not res.get("ok"):
+                    raise RuntimeError(f"pi 工人执行失败: {res.get('error') or proc.stderr[-500:]}")
+                _force_rmtree(staging_workspace)
+                shutil.copytree(box_ws, staging_workspace)
+                return res
+            raise RuntimeError(f"pi_worker_runner 未生成结果文件 (code={proc.returncode}): {proc.stderr[-600:]}")
+    finally:
+        try:
+            if box_sess.is_dir():
+                session_dir.mkdir(parents=True, exist_ok=True)
+                for sf in box_sess.glob("*.jsonl"):
+                    if sf.is_file():
+                        shutil.copy2(sf, session_dir / sf.name)
+            t_src = box_transcripts / f"{wid}.jsonl"
+            if t_src.is_file():
+                transcripts_dir.mkdir(parents=True, exist_ok=True)
+                with (transcripts_dir / f"{wid}.jsonl").open("a", encoding="utf-8", newline="\n") as tf:
+                    tf.write(t_src.read_text(encoding="utf-8"))
+            if box_results.is_dir():
+                results_dir.mkdir(parents=True, exist_ok=True)
+                for rf in box_results.glob("*.json"):
+                    if rf.is_file():
+                        shutil.copy2(rf, results_dir / rf.name)
+        finally:
+            _force_rmtree(box_root)
 
 
 _FILE_BLOCK_RE = re.compile(r"```python\s+path=([^\s\n]+)\n(.*?)```", re.DOTALL)
