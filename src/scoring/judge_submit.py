@@ -24,7 +24,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import review_log  # noqa: E402
 
-EVIDENCE_TAG_RE = re.compile(r"\[[CWTRMV]\d{2}\]")
+EVIDENCE_TAG_RE = re.compile(r"\[[CPWTRMV]\d{2}\]")
 
 
 def main() -> int:
@@ -33,16 +33,22 @@ def main() -> int:
     ap.add_argument("--case-id", required=True, help="例如 case-01")
     ap.add_argument("--judge-id", required=True, help="评委唯一标识（重评时保持同一 ID）")
     ap.add_argument("--judge-model", required=True, help="评委模型或姓名")
-    ap.add_argument("--D1", type=float, required=True, help="搭班子与立规矩（0..11）")
-    ap.add_argument("--D2", type=float, required=True, help="任务降维功力（0..10）")
-    ap.add_argument("--D3", type=float, required=True, help="审查批注毒辣度与诚实复盘（0..9）")
+    ap.add_argument("--D1", type=float, required=True, help="侦察、建制与契约前瞻性（0..11）")
+    ap.add_argument("--D2", type=float, required=True, help="任务降维、并行节奏与指令杠杆（0..10）")
+    ap.add_argument("--D3", type=float, required=True, help="零盲裁实证把关、一击纠偏与诚实复盘（0..9）")
     ap.add_argument(
         "--surpasses-level5",
         choices=["yes", "no"],
         default="yes",
-        help="建制、拆单与审查指导是否明确超越 REFERENCE_LEVEL5.md 平庸样本（选 no 时总分锁死 <= 15）",
+        help="是否明显超越 REFERENCE_LEVEL5.md 平庸样本（选 no 时总分锁死 <= 15）",
     )
-    ap.add_argument("--evidence", required=True, help="至少引用 2 条档案证据编号，如 '[C01] [W02] [T03] [R01]'")
+    ap.add_argument(
+        "--grandmaster-tier",
+        choices=["yes", "no"],
+        default=None,
+        help="是否同时满足 RUBRIC.md 四项宗师准入硬条件（选 no 时总分锁死 <= 25）",
+    )
+    ap.add_argument("--evidence", required=True, help="至少引用 2 条档案证据编号，如 '[C01] [P02] [P04] [R01]'")
     ap.add_argument("--note", required=True, help="与 5 级样本的关键对比结论及最强扣分反证")
     ap.add_argument("--review-log", default=str(review_log.DEFAULT_LOG))
     ap.add_argument("--reject-duplicate", action="store_true")
@@ -77,6 +83,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if args.grandmaster_tier == "no" and d_tot > 25.0:
+        print(
+            f"【宗师门槛拦截】已判定未满足四项宗师准入条件（--grandmaster-tier no），D 层总分最高锁死在 25.0 分（当前提交 {d_tot} 分）！",
+            file=sys.stderr,
+        )
+        return 1
 
     rec = {
         "schema_version": review_log.SCHEMA_VERSION,
@@ -88,6 +100,7 @@ def main() -> int:
         "D2": args.D2,
         "D3": args.D3,
         "surpasses_level5": args.surpasses_level5 == "yes",
+        "grandmaster_tier": (args.grandmaster_tier == "yes") if args.grandmaster_tier is not None else (d_tot > 25.0),
         "evidence": args.evidence.strip(),
         "note": args.note.strip(),
     }

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""B 层（统领效率 15 分）+ C 层（组织管控 25 分）指标计算与匿名《统帅调度档案》提取器（metrics.py）。"""
+"""B 层（统筹效率与并行杠杆 20 分）+ C 层（五大统领过程管控维度 25 分）计算与脱敏档案提取器（metrics.py）。"""
 from __future__ import annotations
 
 import ast
@@ -10,6 +10,14 @@ import re
 from pathlib import Path
 
 from src.marshal.state_store import verify_trace_chain
+
+LEGACY_CORE_MODULES = (
+    "cloudhub/db.py",
+    "cloudhub/billing.py",
+    "cloudhub/jobs.py",
+    "cloudhub/auth.py",
+    "cloudhub/app.py",
+)
 
 
 def _parse_iso(ts: str | None) -> float | None:
@@ -54,7 +62,7 @@ def _ast_contract_alignment_ratio(workspace_dir: Path) -> float:
 
     total_refs = 0
     valid_refs = 0
-    for mod_name, tree in trees_by_mod.items():
+    for _, tree in trees_by_mod.items():
         aliases: dict[str, str] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.level == 1:
@@ -81,9 +89,219 @@ def _ast_contract_alignment_ratio(workspace_dir: Path) -> float:
                         valid_refs += 1
 
     if total_refs == 0:
-        # 单文件无跨模块拆分时跨模块契约对齐得分为 0.3（不鼓励单文件巨石）
-        return 0.3 if len(py_files) == 1 else 0.5
+        return 0.25 if len(py_files) == 1 else 0.5
     return valid_refs / total_refs
+
+
+def _count_test_assertions(workspace_dir: Path) -> tuple[int, int]:
+    """静态统计 workspace/tests/*.py 中的测试文件数与真实断言语句数（供 C2 与盲评交叉核验）。"""
+    tests_dir = workspace_dir / "tests"
+    if not tests_dir.is_dir():
+        return 0, 0
+    test_files = [p for p in sorted(tests_dir.glob("*.py")) if p.name != "__init__.py"]
+    assert_cnt = 0
+    for fp in test_files:
+        try:
+            tree = ast.parse(fp.read_text(encoding="utf-8", errors="ignore"), filename=fp.name)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assert):
+                assert_cnt += 1
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr.startswith("assert"):
+                    assert_cnt += 1
+    return len(test_files), assert_cnt
+
+
+def extract_process_observables(run_path: Path, state: dict, trace_events: list[dict]) -> dict:
+    """提取五大统领过程核心维度的客观事实指标（供 B/C 算分与盲评档案 `[P]` 证据组共用）。"""
+    workers: dict = state.get("workers") or {}
+    subs: dict = state.get("submissions") or {}
+
+    # 1. 前期侦察纪律（首张派单前、首次立契约前实际阅读了几个存量核心模块）
+    first_dispatch_idx = next((i for i, e in enumerate(trace_events) if e.get("action") == "dispatch_task" and e.get("type") == "tool"), len(trace_events))
+    first_contract_idx = next((i for i, e in enumerate(trace_events) if e.get("action") == "define_contract" and e.get("type") == "tool"), len(trace_events))
+    unlock_p2_idx = next((i for i, e in enumerate(trace_events) if e.get("action") == "unlock_phase2"), None)
+
+    recon_before_dispatch: set[str] = set()
+    recon_before_contract: set[str] = set()
+    for idx, ev in enumerate(trace_events):
+        if ev.get("action") == "inspect_and_test" and (ev.get("payload") or {}).get("target") == "trunk":
+            p = ((ev.get("payload") or {}).get("path") or "").strip()
+            if p in LEGACY_CORE_MODULES:
+                if idx < first_dispatch_idx:
+                    recon_before_dispatch.add(p)
+                if idx < first_contract_idx:
+                    recon_before_contract.add(p)
+
+    # 2. 并行波次、工位交替流转与单点死磕阻塞检测
+    # 扫描轨迹：统计同波次并行（wave_id 共享 / 执行区间重叠 / 他人工位已有 PENDING 待审时并发派发其他工位）
+    pending_by_worker: dict[str, str | None] = {}
+    co_scheduled_subs: set[str] = set()
+    wave_Buckets: dict[str, list[str]] = {}
+    intervals: list[tuple[str, str, int, int]] = []
+    exec_worker_seq: list[str] = []
+
+    for ev in trace_events:
+        if ev.get("type") != "tool":
+            continue
+        act = ev.get("action")
+        pl = ev.get("payload") or {}
+        if act == "dispatch_task":
+            wid = str(pl.get("worker_id") or "")
+            sid = str(pl.get("submission_id") or "")
+            exec_worker_seq.append(wid)
+            other_pending = any(v is not None for k, v in pending_by_worker.items() if k != wid)
+            if other_pending and sid:
+                co_scheduled_subs.add(sid)
+            pending_by_worker[wid] = sid
+            w_id = pl.get("wave_id")
+            if w_id and sid:
+                wave_Buckets.setdefault(str(w_id), []).append(sid)
+            s_ms = pl.get("started_ms")
+            f_ms = pl.get("finished_ms")
+            if isinstance(s_ms, int) and isinstance(f_ms, int) and sid:
+                intervals.append((sid, wid, s_ms, f_ms))
+        elif act == "review_submission":
+            wid = str(pl.get("worker_id") or "")
+            dec = str(pl.get("decision") or "")
+            if dec == "APPROVE" or (dec == "REJECT" and pl.get("discard_only")):
+                pending_by_worker[wid] = None
+        elif act == "rework_completed":
+            wid = str(pl.get("worker_id") or "")
+            nsid = str(pl.get("new_submission_id") or "")
+            exec_worker_seq.append(wid)
+            pending_by_worker[wid] = nsid
+
+    for sids in wave_Buckets.values():
+        if len(sids) >= 2:
+            co_scheduled_subs.update(sids)
+
+    for i in range(len(intervals)):
+        sid_i, wid_i, s_i, f_i = intervals[i]
+        for j in range(i + 1, len(intervals)):
+            sid_j, wid_j, s_j, f_j = intervals[j]
+            if wid_i != wid_j and max(s_i, s_j) <= min(f_i, f_j):
+                co_scheduled_subs.add(sid_i)
+                co_scheduled_subs.add(sid_j)
+
+    initial_subs = [s for s in subs.values() if not s.get("rework_of")]
+    parallel_ratio = len(co_scheduled_subs) / max(1, len(initial_subs))
+
+    max_same_worker_streak = 0
+    cur_streak = 0
+    prev_w = None
+    for wid in exec_worker_seq:
+        if wid == prev_w:
+            cur_streak += 1
+        else:
+            cur_streak = 1
+            prev_w = wid
+        if cur_streak > max_same_worker_streak:
+            max_same_worker_streak = cur_streak
+
+    # 3. 工位合入代码量分布（防“一工位包干九成代码，两工位陪跑”）
+    merged_chars_by_worker: dict[str, int] = {wid: 0 for wid in workers}
+    for s in subs.values():
+        if s.get("status") == "APPROVED":
+            wid = s.get("worker_id")
+            if wid in merged_chars_by_worker:
+                merged_chars_by_worker[wid] += max(1, int(s.get("diff_chars", 0)))
+    total_merged_chars = sum(merged_chars_by_worker.values())
+    active_wids = [wid for wid, w in workers.items() if int(w.get("approved_count", 0)) > 0]
+    max_worker_code_share = (
+        max((merged_chars_by_worker[wid] / total_merged_chars for wid in active_wids), default=1.0)
+        if total_merged_chars > 0 and active_wids
+        else 1.0
+    )
+
+    # 4. 实证审查把关（核查每一次 APPROVE 和 REJECT 前是否做过代码审阅或叠加测试）与打回一击修复率
+    verdict_events = [
+        ev["payload"]
+        for ev in trace_events
+        if ev.get("type") == "tool" and ev.get("action") == "review_submission"
+    ]
+    blind_verdict_subs: list[str] = []
+    verified_verdicts = 0
+    for vp in verdict_events:
+        if vp.get("inspected_before_review") or vp.get("tested_before_review"):
+            verified_verdicts += 1
+        else:
+            blind_verdict_subs.append(f"{vp.get('submission_id')}({vp.get('decision')})")
+
+    reject_events = [vp for vp in verdict_events if vp.get("decision") == "REJECT"]
+    one_shot_fixes = 0
+    ineffective_reworks = 0
+    for r_vp in reject_events:
+        target_sid = r_vp.get("submission_id")
+        comment_txt = (r_vp.get("comment") or "").strip()
+        is_specific = len(comment_txt) >= 45
+        if r_vp.get("discard_only"):
+            ineffective_reworks += 1
+            continue
+        child_sub = next((s for s in subs.values() if s.get("rework_of") == target_sid), None)
+        if is_specific and child_sub and child_sub.get("status") == "APPROVED" and int(child_sub.get("rework_depth", 1)) == 1:
+            one_shot_fixes += 1
+        else:
+            ineffective_reworks += 1
+
+    # 5. 二阶段抗冲击弹性与阶段测试节奏
+    phase2_reworks = sum(
+        1
+        for s in subs.values()
+        if int(s.get("phase", 1)) == 2 and s.get("rework_of") is not None
+    )
+    pre_p2_tested = False
+    post_p2_regression_fail = False
+    if unlock_p2_idx is not None:
+        pre_p2_tested = any(
+            idx < unlock_p2_idx
+            and ev.get("action") == "inspect_and_test"
+            and (ev.get("payload") or {}).get("target") in ("smoke", "unittest")
+            and (ev.get("payload") or {}).get("passed") is True
+            for idx, ev in enumerate(trace_events)
+        )
+        # 检查二阶段最后一次合入后是否残留未修平的测试失败
+        last_test_after_p2 = [
+            (ev.get("payload") or {}).get("passed")
+            for idx, ev in enumerate(trace_events)
+            if idx > unlock_p2_idx
+            and ev.get("action") == "inspect_and_test"
+            and (ev.get("payload") or {}).get("target") in ("smoke", "unittest")
+            and not (ev.get("payload") or {}).get("submission_id")
+        ]
+        if last_test_after_p2 and (last_test_after_p2[-1] is False):
+            post_p2_regression_fail = True
+
+    test_file_cnt, test_assert_cnt = _count_test_assertions(run_path / "workspace")
+
+    ticket_lengths = [len((s.get("ticket") or "").strip()) for s in initial_subs if s.get("ticket")]
+    avg_ticket_chars = (sum(ticket_lengths) / len(ticket_lengths)) if ticket_lengths else 0.0
+
+    return {
+        "recon_before_dispatch": sorted(recon_before_dispatch),
+        "recon_before_contract": sorted(recon_before_contract),
+        "co_scheduled_count": len(co_scheduled_subs),
+        "initial_dispatches_count": len(initial_subs),
+        "parallel_ratio": round(parallel_ratio, 3),
+        "max_same_worker_streak": max_same_worker_streak,
+        "merged_chars_by_worker": merged_chars_by_worker,
+        "max_worker_code_share": round(max_worker_code_share, 3),
+        "total_verdicts": len(verdict_events),
+        "verified_verdicts": verified_verdicts,
+        "blind_verdict_subs": blind_verdict_subs,
+        "reject_count": len(reject_events),
+        "one_shot_fixes": one_shot_fixes,
+        "ineffective_reworks": ineffective_reworks,
+        "phase2_unlocked": bool(state.get("phase2_unlocked", False)),
+        "phase2_reworks": phase2_reworks,
+        "pre_p2_tested": pre_p2_tested,
+        "post_p2_regression_fail": post_p2_regression_fail,
+        "test_file_cnt": test_file_cnt,
+        "test_assert_cnt": test_assert_cnt,
+        "avg_ticket_chars": round(avg_ticket_chars, 1),
+    }
 
 
 def compute_bc_scores(
@@ -102,7 +320,7 @@ def compute_bc_scores(
     a_total = 0.0 if tampered else float(a_report.get("A_total", 0.0))
 
     s_cfg = config.get("scoring") or {}
-    a_max = float((s_cfg.get("A") or {}).get("max", 30.0))
+    a_max = float((s_cfg.get("A") or {}).get("max", 25.0))
     b_cfg = s_cfg.get("B") or {}
     c_cfg = s_cfg.get("C") or {}
 
@@ -113,7 +331,6 @@ def compute_bc_scores(
     if t0 is not None and t1 is not None and t1 >= t0:
         e2e_sec = max(0.0, (t1 - t0) - pause_sec)
     else:
-        # 若单局由 score_run 单独调试尚未写 end_iso，则取最后一条 trace 时间
         last_ms = trace_events[-1]["t"] if trace_events else ((t0 or 0) * 1000)
         e2e_sec = max(0.0, (last_ms / 1000.0) - (t0 or (last_ms / 1000.0)) - pause_sec)
     e2e_min = e2e_sec / 60.0
@@ -146,43 +363,86 @@ def compute_bc_scores(
             "run_summary": {"dispatches_used": dispatches_used, "workers_total": len(workers), "approved_count": approved_count, "e2e_min": round(e2e_min, 2)},
         }
 
-    # ---------------- B 层：统领效率与经济性（15 分，受 A / 30 封顶） ----------------
-    cap_ratio = (a_total / a_max) if b_cfg.get("cap_by_a_ratio", True) else 1.0
+    obs = extract_process_observables(run_path, state, trace_events)
+    total_worker_tokens = sum(int((s.get("worker_tokens") or {}).get("total_tokens") or 0) for s in subs.values())
+
+    # ---------------- B 层：统筹效率、并行度与指令经济性（20 分 = B1 10 + B2 10，受 A / 25 封顶） ----------------
+    cap_ratio = (a_total / max(1.0, a_max)) if b_cfg.get("cap_by_a_ratio", True) else 1.0
     cap_ratio = max(0.0, min(1.0, cap_ratio))
 
-    ideal_d = int(b_cfg.get("b1_ideal_dispatches", 7))
-    max_d = int(b_cfg.get("b1_max_dispatches", 14))
+    # B1.1 同波次并行推进度 (1.8) + 轮次转化效率 (1.2) = 3.0
+    target_par = float(b_cfg.get("b1_target_parallel_ratio", 0.45))
+    b1_parallel_score = 1.8 * min(1.0, obs["parallel_ratio"] / max(0.05, target_par)) if approved_count > 0 else 0.0
+
+    ideal_d = int(b_cfg.get("b1_ideal_dispatches", 8))
+    max_d = int(b_cfg.get("b1_max_dispatches", 15))
     if dispatches_used == 0 or approved_count == 0:
         b1_disp_score = 0.0
     elif dispatches_used <= ideal_d:
-        b1_disp_score = 2.0
+        b1_disp_score = 0.6
     elif dispatches_used >= max_d:
         b1_disp_score = 0.0
     else:
-        b1_disp_score = 2.0 * (max_d - dispatches_used) / max(1, max_d - ideal_d)
+        b1_disp_score = 0.6 * (max_d - dispatches_used) / max(1, max_d - ideal_d)
 
     conv_ratio = approved_count / max(1, dispatches_used)
     floor_c = float(b_cfg.get("b1_floor_first_pass_ratio", 0.35))
-    ideal_c = float(b_cfg.get("b1_ideal_first_pass_ratio", 0.70))
-    if dispatches_used == 0:
+    ideal_c = float(b_cfg.get("b1_ideal_first_pass_ratio", 0.72))
+    if dispatches_used == 0 or conv_ratio <= floor_c:
         b1_conv_score = 0.0
     elif conv_ratio >= ideal_c:
-        b1_conv_score = 2.0
-    elif conv_ratio <= floor_c:
-        b1_conv_score = 0.0
+        b1_conv_score = 0.6
     else:
-        b1_conv_score = 2.0 * (conv_ratio - floor_c) / max(0.01, ideal_c - floor_c)
+        b1_conv_score = 0.6 * (conv_ratio - floor_c) / max(0.01, ideal_c - floor_c)
 
-    smug_pen = float(b_cfg.get("b1_smuggling_penalty", 0.5)) * smuggling_count
-    mid_b_pen = float(b_cfg.get("b1_midflight_contract_penalty", 0.5)) * midflight_contract_revs
-    err_pen = float(b_cfg.get("b1_tool_error_penalty", 0.25)) * tool_error_count
-    b1_disc_score = max(0.0, 1.0 - smug_pen - mid_b_pen - err_pen) if approved_count > 0 else 0.0
+    # B1.2 工人词元能效比 (3.0) + 统帅指令信噪比 (1.5) = 4.5
+    w_mode = str(state.get("worker_mode", "pi"))
+    if w_mode == "mock" and total_worker_tokens < 200_000:
+        tok_free = float(b_cfg.get("b1_mock_token_free", 16000))
+        tok_hl = float(b_cfg.get("b1_mock_token_halflife", 14000))
+    else:
+        tok_free = float(b_cfg.get("b1_pi_token_free", 4800000))
+        tok_hl = float(b_cfg.get("b1_pi_token_halflife", 4500000))
 
-    b1_raw = min(float(b_cfg.get("b1_economy_max", 5.0)), b1_disp_score + b1_conv_score + b1_disc_score)
+    if approved_count == 0:
+        b1_token_score = 0.0
+    elif total_worker_tokens <= tok_free:
+        b1_token_score = 3.0
+    else:
+        b1_token_score = 3.0 * (0.5 ** ((total_worker_tokens - tok_free) / max(1.0, tok_hl)))
+
+    contract_chars = int(state.get("contract_chars", 0))
+    if contract_chars < 220:
+        snr_con = 0.1 if contract_chars > 0 else 0.0
+    elif contract_chars <= 4200:
+        snr_con = 0.8
+    else:
+        snr_con = max(0.25, 0.8 - 0.55 * ((contract_chars - 4200) / 1300.0))
+
+    avg_t = obs["avg_ticket_chars"]
+    if avg_t < 80 or approved_count == 0:
+        snr_tkt = 0.1 if approved_count > 0 else 0.0
+    elif avg_t <= 1250:
+        snr_tkt = 0.7
+    else:
+        snr_tkt = max(0.2, 0.7 - 0.5 * ((avg_t - 1250) / 750.0))
+    b1_snr_score = snr_con + snr_tkt
+
+    # B1.3 零违规与操作合规度 (2.5)
+    smug_pen = float(b_cfg.get("b1_smuggling_penalty", 0.8)) * smuggling_count
+    mid_b_pen = float(b_cfg.get("b1_midflight_contract_penalty", 0.8)) * midflight_contract_revs
+    err_pen = float(b_cfg.get("b1_tool_error_penalty", 0.35)) * tool_error_count
+    b1_disc_score = max(0.0, 2.5 - smug_pen - mid_b_pen - err_pen) if approved_count > 0 else 0.0
+
+    b1_raw = min(
+        float(b_cfg.get("b1_economy_max", 10.0)),
+        b1_parallel_score + b1_disp_score + b1_conv_score + b1_token_score + b1_snr_score + b1_disc_score,
+    )
     b1_final = round(b1_raw * cap_ratio, 2)
 
-    free_min = float(b_cfg.get("b2_free_min", 6.0))
-    hl_min = float(b_cfg.get("b2_halflife_min", 8.0))
+    # B2 关键路径墙钟耗时 (10.0)
+    free_min = float(b_cfg.get("b2_free_min", 20.0))
+    hl_min = float(b_cfg.get("b2_halflife_min", 18.0))
     b2_max = float(b_cfg.get("b2_timing_max", 10.0))
     if approved_count == 0:
         b2_raw = 0.0
@@ -193,19 +453,24 @@ def compute_bc_scores(
     b2_final = round(b2_raw * cap_ratio, 2)
     b_total = round(b1_final + b2_final, 2)
 
-    # ---------------- C 层：组织管控与把关（25 分） ----------------
+    # ---------------- C 层：五大统领过程管控维度（25 分 = C1 8 + C2 9 + C3 8） ----------------
     if approved_count == 0:
         c_gate = 0.0
     else:
-        gate_th = float(c_cfg.get("low_delivery_gate_threshold_a", 12.0))
-        gate_fl = float(c_cfg.get("low_delivery_gate_floor", 0.25))
+        gate_th = float(c_cfg.get("low_delivery_gate_threshold_a", 15.0))
+        gate_fl = float(c_cfg.get("low_delivery_gate_floor", 0.20))
         c_gate = 1.0 if a_total >= gate_th else max(gate_fl, a_total / max(1.0, gate_th))
 
     active_workers = [w for w in workers.values() if int(w.get("approved_count", 0)) > 0]
     ghost_workers_cnt = sum(1 for w in workers.values() if int(w.get("approved_count", 0)) == 0)
     n_active = len(active_workers)
 
-    # C1: 角色领地正交度与跨模块零踩踏冲突（满分 9.0）
+    # C1 (满分 8.0)：先侦察后决策情报纪律 (2.5) + 领地正交零冲突 (2.5) + 契约前瞻与二阶段抗冲击弹性 (3.0)
+    c1_recon = (
+        1.75 * (len(obs["recon_before_dispatch"]) / 5.0)
+        + 0.75 * (len(obs["recon_before_contract"]) / 5.0)
+    )
+
     all_paths_list = [p for w in workers.values() for p in (w.get("allowed_paths") or [])]
     unique_paths = set(all_paths_list)
     overlap_extra = max(0, len(all_paths_list) - len(unique_paths))
@@ -216,131 +481,115 @@ def compute_bc_scores(
     elif max_files_bound <= 2:
         focus_factor = 1.0
     elif max_files_bound == 3:
-        focus_factor = 0.92
+        focus_factor = 0.98
     else:
-        focus_factor = 0.80
-    c1_ortho = 3.5 * disjoint_ratio * focus_factor
-
+        focus_factor = 0.75
     merge_conflicts = int(state.get("merge_conflicts_count", 0))
     syntax_broken = int(state.get("syntax_broken_merges", 0))
-    c1_clean_merge = max(0.0, 2.5 - 1.25 * merge_conflicts - 1.25 * syntax_broken)
+    c1_ortho_clean = 1.5 * disjoint_ratio * focus_factor + max(0.0, 1.0 - 0.6 * merge_conflicts - 0.6 * syntax_broken)
 
     contract_first = bool(state.get("contract_defined_before_first_dispatch"))
-    contract_chars = int(state.get("contract_chars", 0))
-    if contract_first and contract_chars >= 320:
-        c1_con_pre = 1.5
-    elif contract_first and contract_chars >= 100:
-        c1_con_pre = 0.7
-    elif contract_chars >= 200:
-        c1_con_pre = 0.4
-    else:
-        c1_con_pre = 0.0
+    c1_con_pre = 0.8 if (contract_first and contract_chars >= 320) else (0.35 if contract_first and contract_chars >= 120 else 0.0)
     ast_align = _ast_contract_alignment_ratio(run_path / "workspace")
-    c1_contract_align = c1_con_pre + 1.5 * ast_align
+    if obs["phase2_unlocked"]:
+        p2_score = max(
+            0.0,
+            1.5 - 0.45 * obs["phase2_reworks"] - (0.6 if obs["post_p2_regression_fail"] else 0.0),
+        )
+    else:
+        p2_score = 0.0
     mid_c1_pen = float(c_cfg.get("c1_midflight_contract_penalty", 1.5)) * midflight_contract_revs
-    c1_raw = max(0.0, c1_ortho + c1_clean_merge + c1_contract_align - mid_c1_pen)
-    c1_final = round(min(9.0, c1_raw * c_gate), 2)
+    c1_raw = max(0.0, c1_recon + c1_ortho_clean + c1_con_pre + 0.7 * ast_align + p2_score - mid_c1_pen)
+    c1_final = round(min(8.0, c1_raw * c_gate), 2)
 
-    free_rw = int(c_cfg.get("free_reworks_allowance", 2))
-    excess_reworks = max(0, rework_churn - free_rw)
-    rw_pen_half = 0.5 * float(c_cfg.get("excess_rework_penalty", 1.2)) * excess_reworks
-    bloat_th = int(c_cfg.get("dispatch_bloat_threshold", 9))
-    bloat_pen = float(c_cfg.get("dispatch_bloat_penalty", 0.5)) * max(0, dispatches_used - bloat_th)
-
-    # C2: 代码审查把关与缺陷拦截率（满分 8.0）
-    inspected_approvals = sum(1 for s in approved_subs if s.get("inspected_before_review") or s.get("tested_before_review"))
-    c2_pre_inspect = 3.5 * (inspected_approvals / max(1, approved_count))
-
-    reject_events = [
-        ev["payload"]
-        for ev in trace_events
-        if ev.get("action") == "review_submission" and (ev.get("payload") or {}).get("decision") == "REJECT"
-    ]
-    specific_rejects = sum(
-        1
-        for r in reject_events
-        if len((r.get("comment") or "").strip()) >= 35
+    # C2 (满分 9.0)：全裁决零盲裁实证预检 (3.5) + 打回一击修平率/零免费返工 (3.0) + 阶段回归与断言密度 (2.5)
+    blind_cnt = len(obs["blind_verdict_subs"])
+    blind_pen = float(c_cfg.get("blind_verdict_penalty", 0.65)) * blind_cnt
+    c2_zero_blind = max(
+        0.0,
+        3.5 * (obs["verified_verdicts"] / max(1, obs["total_verdicts"])) - blind_pen,
     )
-    if specific_rejects >= 1 and syntax_broken == 0:
-        c2_defect_gate = 2.5
-    elif len(reject_events) >= 1:
-        # 打回批注敷衍（如“报错了请重修”）
-        c2_defect_gate = 1.1
+
+    rw_decay = float(c_cfg.get("rework_step_decay", 0.30))
+    ineff_pen = float(c_cfg.get("ineffective_rework_penalty", 0.90))
+    if rework_churn == 0 and obs["reject_count"] == 0:
+        c2_rework_prec = 3.0 * min(1.0, a_total / max(1.0, 0.9 * a_max))
     else:
-        if a_total >= 27.0:
-            c2_defect_gate = 2.2
-        else:
-            c2_defect_gate = 1.25 * (a_total / max(1.0, a_max))
+        one_shot_rate = obs["one_shot_fixes"] / max(1, obs["reject_count"])
+        c2_rework_prec = max(
+            0.0,
+            2.85 * one_shot_rate - rw_decay * max(0, rework_churn - 1) - ineff_pen * obs["ineffective_reworks"],
+        )
 
-    unittest_passed = any(
-        ev.get("action") == "inspect_and_test"
-        and (ev.get("payload") or {}).get("target") == "unittest"
-        and (ev.get("payload") or {}).get("passed") is True
-        for ev in trace_events
-    )
-    smoke_passed = any(
-        ev.get("action") == "inspect_and_test"
-        and (ev.get("payload") or {}).get("target") == "smoke"
-        and (ev.get("payload") or {}).get("passed") is True
-        for ev in trace_events
-    )
-    c2_test_exec = (1.1 if unittest_passed else 0.0) + (0.9 if smoke_passed else 0.0)
-    c2_raw = max(0.0, c2_pre_inspect + c2_defect_gate + c2_test_exec - rw_pen_half)
-    c2_final = round(min(8.0, c2_raw * c_gate), 2)
-
-    # C3: 团队分工均衡度与拓扑节奏（满分 8.0）
-    if n_active <= 1:
-        c3_size = 0.0
-    elif n_active == 2:
-        c3_size = 1.6
-    elif n_active == 3:
-        c3_size = 2.6
-    else:
-        c3_size = 3.5
-    c3_size = max(0.0, c3_size - 0.8 * ghost_workers_cnt)
-
-    if n_active <= 1:
-        c3_balance = 0.0
-    else:
-        counts = [max(1, int(w.get("dispatch_count", 0))) for w in active_workers]
-        tot_c = sum(counts)
-        ent = -sum((c / tot_c) * math.log(c / tot_c) for c in counts if c > 0)
-        norm_ent = ent / math.log(n_active)
-        c3_balance = 2.5 * norm_ent
-
-    # 拓扑秩序：契约先行(0.7) + 底层模块先于网关合入(0.7) + 末次合入后执行终局测试验证(0.6)
     approve_indices = [
         (idx, (ev.get("payload") or {}).get("merged_files") or [])
         for idx, ev in enumerate(trace_events)
         if ev.get("action") == "review_submission" and (ev.get("payload") or {}).get("decision") == "APPROVE"
     ]
+    last_approve_idx = approve_indices[-1][0] if approve_indices else -1
+    post_merge_ut = any(
+        idx > last_approve_idx
+        and ev.get("action") == "inspect_and_test"
+        and (ev.get("payload") or {}).get("target") == "unittest"
+        and (ev.get("payload") or {}).get("passed") is True
+        for idx, ev in enumerate(trace_events)
+    )
+    c2_test_depth = (
+        (0.6 if obs["pre_p2_tested"] else 0.0)
+        + (0.8 if post_merge_ut else 0.0)
+        + 1.1 * min(1.0, obs["test_assert_cnt"] / 12.0)
+    )
+    c2_raw = max(0.0, c2_zero_blind + c2_rework_prec + c2_test_depth)
+    c2_final = round(min(9.0, c2_raw * c_gate), 2)
+
+    # C3 (满分 8.0)：三工位满编激活 (2.5) + 频次与代码量双均衡 (3.0) + 并行/交替流转防单点死磕 (2.5)
+    if n_active <= 1:
+        c3_size = 0.0
+    elif n_active == 2:
+        c3_size = 1.3
+    else:
+        c3_size = 2.5
+    c3_size = max(0.0, c3_size - 0.8 * ghost_workers_cnt)
+
+    if n_active <= 1:
+        c3_disp_ent = 0.0
+        c3_code_bal = 0.0
+    else:
+        counts = [max(1, int(w.get("dispatch_count", 0))) for w in active_workers]
+        tot_c = sum(counts)
+        ent = -sum((c / tot_c) * math.log(c / tot_c) for c in counts if c > 0)
+        c3_disp_ent = 1.5 * (ent / math.log(n_active))
+        max_sh = obs["max_worker_code_share"]
+        if max_sh <= 0.58:
+            c3_code_bal = 1.5
+        elif max_sh >= 0.90:
+            c3_code_bal = 0.2
+        else:
+            c3_code_bal = 1.5 - 1.3 * ((max_sh - 0.58) / 0.32)
+
     first_app_merge_idx = next((idx for idx, files in approve_indices if "cloudhub/app.py" in files), None)
     first_domain_merge_idx = next(
         (idx for idx, files in approve_indices if any(f.startswith("cloudhub/") and f != "cloudhub/app.py" for f in files)),
         None,
     )
-    bottom_up_ok = (
-        first_domain_merge_idx is not None
-        and (first_app_merge_idx is None or first_domain_merge_idx <= first_app_merge_idx)
+    bottom_up_ok = first_domain_merge_idx is not None and (first_app_merge_idx is None or first_domain_merge_idx <= first_app_merge_idx)
+
+    streak_excess = max(0, obs["max_same_worker_streak"] - 2)
+    streak_pen = float(c_cfg.get("same_worker_streak_penalty", 0.85)) * streak_excess
+    bloat_th = int(c_cfg.get("dispatch_bloat_threshold", 10))
+    bloat_pen = float(c_cfg.get("dispatch_bloat_penalty", 0.4)) * max(0, dispatches_used - bloat_th)
+
+    c3_flow = (
+        (0.4 if contract_first else 0.0)
+        + (0.4 if bottom_up_ok else 0.0)
+        + 1.7 * min(1.0, 0.35 + 0.65 * min(1.0, obs["parallel_ratio"] / 0.35))
+        - streak_pen
+        - bloat_pen
     )
-    last_approve_idx = approve_indices[-1][0] if approve_indices else -1
-    post_merge_verified = any(
-        idx > last_approve_idx
-        and ev.get("action") == "inspect_and_test"
-        and (ev.get("payload") or {}).get("target") in ("smoke", "unittest")
-        and (ev.get("payload") or {}).get("passed") is True
-        for idx, ev in enumerate(trace_events)
-    )
-    c3_topo = (0.7 if contract_first else 0.0) + (0.7 if bottom_up_ok else 0.0) + (0.6 if post_merge_verified else 0.0)
-    c3_raw = max(0.0, c3_size + c3_balance + c3_topo - rw_pen_half - bloat_pen)
+    c3_raw = max(0.0, c3_size + c3_disp_ent + c3_code_bal + max(0.0, c3_flow))
     c3_final = round(min(8.0, c3_raw * c_gate), 2)
 
     c_total = round(c1_final + c2_final + c3_final, 2)
-
-    total_worker_tokens = sum(
-        int((s.get("worker_tokens") or {}).get("total_tokens") or 0)
-        for s in subs.values()
-    )
 
     return {
         "tampered": False,
@@ -351,11 +600,17 @@ def compute_bc_scores(
         "B_total": b_total,
         "B_detail": {
             "b1_raw": round(b1_raw, 2),
+            "b1_parallel": round(b1_parallel_score, 2),
+            "b1_token_efficiency": round(b1_token_score, 2),
+            "b1_snr": round(b1_snr_score, 2),
+            "b1_discipline": round(b1_disc_score, 2),
             "b2_raw": round(b2_raw, 2),
             "cap_ratio": round(cap_ratio, 4),
             "e2e_min": round(e2e_min, 3),
             "b2_reliable": bool(b2_reliable),
+            "parallel_ratio": obs["parallel_ratio"],
             "conversion_ratio": round(conv_ratio, 3),
+            "worker_tokens_total": total_worker_tokens,
             "code_smuggling_count": smuggling_count,
             "tool_error_count": tool_error_count,
         },
@@ -365,23 +620,30 @@ def compute_bc_scores(
         "C_total": c_total,
         "C_detail": {
             "c_gate": round(c_gate, 3),
-            "c1_ortho": round(c1_ortho, 2),
-            "c1_clean_merge": round(c1_clean_merge, 2),
-            "c1_contract_align": round(c1_contract_align, 2),
-            "c2_pre_inspect": round(c2_pre_inspect, 2),
-            "c2_defect_gate": round(c2_defect_gate, 2),
-            "c2_test_exec": round(c2_test_exec, 2),
+            "c1_recon": round(c1_recon, 2),
+            "c1_ortho_clean": round(c1_ortho_clean, 2),
+            "c1_phase2_evolution": round(p2_score, 2),
+            "c2_zero_blind_verdict": round(c2_zero_blind, 2),
+            "c2_rework_precision": round(c2_rework_prec, 2),
+            "c2_test_depth": round(c2_test_depth, 2),
             "c3_size": round(c3_size, 2),
-            "c3_balance": round(c3_balance, 2),
-            "c3_topo": round(c3_topo, 2),
+            "c3_dual_balance": round(c3_disp_ent + c3_code_bal, 2),
+            "c3_flow": round(max(0.0, c3_flow), 2),
+            "blind_verdicts_count": blind_cnt,
+            "max_same_worker_streak": obs["max_same_worker_streak"],
+            "max_worker_code_share": obs["max_worker_code_share"],
+            "test_assert_count": obs["test_assert_cnt"],
             "midflight_contract_revisions": midflight_contract_revs,
-            "excess_reworks": excess_reworks,
-            "rework_and_bloat_penalty": round(2 * rw_pen_half + bloat_pen, 2),
         },
         "run_summary": {
             "workers_total": len(workers),
             "workers_active": n_active,
             "ghost_workers": ghost_workers_cnt,
+            "phase2_unlocked": obs["phase2_unlocked"],
+            "recon_modules_before_dispatch": len(obs["recon_before_dispatch"]),
+            "parallel_ratio": obs["parallel_ratio"],
+            "max_same_worker_streak": obs["max_same_worker_streak"],
+            "blind_verdicts_count": blind_cnt,
             "contract_version": int(state.get("contract_version", 0)),
             "contract_chars": contract_chars,
             "contract_before_dispatch": contract_first,
@@ -390,9 +652,10 @@ def compute_bc_scores(
             "approved_count": approved_count,
             "rejected_count": len(rejected_subs),
             "rework_churn": rework_churn,
-            "specific_rejects": specific_rejects,
+            "one_shot_fixes": obs["one_shot_fixes"],
             "code_smuggling_count": smuggling_count,
             "worker_tokens_total": total_worker_tokens,
+            "test_assert_count": obs["test_assert_cnt"],
             "e2e_min": round(e2e_min, 2),
         },
     }
@@ -403,16 +666,16 @@ def _scrub_secrets(text: str, secret_tokens: set[str]) -> str:
     for tok in sorted(secret_tokens, key=len, reverse=True):
         if tok and len(tok) >= 3:
             out = re.sub(re.escape(tok), "anonymous-marshal", out, flags=re.IGNORECASE)
-    # 清洗任何残留 runs/<xxx> 路径痕迹
     out = re.sub(r"runs[\\/][^\\/\s\"']+", "runs/anonymous-marshal", out, flags=re.IGNORECASE)
     return out
 
 
 def generate_anonymized_dossier(run_dir: Path, case_id: str, secret_tokens: set[str]) -> dict[str, str]:
-    """从冻结运行产物生成完全脱敏的《统帅调度档案》（绝不含模型名、墙钟时间与 A/B/C 分数）。"""
+    """从冻结运行产物生成完全脱敏的《统帅调度档案》（含五大统领过程行为客观取证 `[P]` 组，绝不含模型名、耗时与客观分）。"""
     run_path = Path(run_dir).resolve()
     state = json.loads((run_path / ".marshal_state" / "state.json").read_text(encoding="utf-8"))
     _, _, trace_events = verify_trace_chain(run_path / "trace.jsonl")
+    obs = extract_process_observables(run_path, state, trace_events)
 
     contract_file = run_path / ".marshal_state" / "GLOBAL_CONTRACT.md"
     contract_raw = contract_file.read_text(encoding="utf-8") if contract_file.is_file() else "（未定义全局架构契约）"
@@ -420,18 +683,26 @@ def generate_anonymized_dossier(run_dir: Path, case_id: str, secret_tokens: set[
     retro_raw = retro_file.read_text(encoding="utf-8") if retro_file.is_file() else "（未填写统领复盘说明）"
 
     workers = state.get("workers") or {}
+    subs = state.get("submissions") or {}
+    total_worker_tokens = sum(int((s.get("worker_tokens") or {}).get("total_tokens") or 0) for s in subs.values())
+    missed_legacy = [m for m in LEGACY_CORE_MODULES if m not in obs["recon_before_dispatch"]]
 
-    # 1. 组装主事实档案卡 case-XX.md（带结构化证据编号 [C..]/[W..]/[T..]/[R..]/[M..]）
     lines: list[str] = [
         f"# 统帅调度档案 · {case_id}",
         "",
-        "> **盲评须知**：本档案已彻底抹除被测统帅模型标识、墙钟耗时与客观得分。请先阅读同目录下的 `REFERENCE_LEVEL5.md`（官方 5 级传声筒平庸统帅参照样本）与 `RUBRIC.md`，凡建制、拆单与审查指导未明显超越 5 级样本者，D 层总分严格锁死 `<= 15 / 30`！",
+        "> **盲评须知**：本档案已彻底抹除被测统帅模型标识、墙钟绝对耗时与客观得分。请先阅读同目录下的 `REFERENCE_LEVEL5.md` 与 `RUBRIC.md`（含 15 分平庸硬锁顶、25 分宗师准入门槛及六项过程硬扣分清单），严格依据下方证据编号打分！",
         "",
-        "## 一、全局统领概览与契约建立记录（`[C]` 证据组）",
+        "## 一、全局统领概览与五大过程维度客观取证（`[C]` / `[P]` 证据组）",
         "",
-        f"- `[C01]` 全局架构契约修订次数：`{state.get('contract_version', 0)}` 次（其中派单启动后中途打补丁改约：`{state.get('contract_revisions_after_dispatch', 0)}` 次），终版字符数：`{state.get('contract_chars', 0)}` 字符",
+        f"- `[C01]` 全局架构契约修订次数：`{state.get('contract_version', 0)}` 次（其中非豁免中途补丁改约：`{state.get('contract_revisions_after_dispatch', 0)}` 次），终版字符数：`{state.get('contract_chars', 0)}` 字符（硬上限 5500 字符）",
         f"- `[C02]` 契约是否先于首张派单确立：`{'是（契约先行）' if state.get('contract_defined_before_first_dispatch') else '否（未立契约即裸派单）'}`",
-        f"- `[C03]` 团队工位总数：`{len(workers)}` 个（上限 5 个）；总派单轮次：`{state.get('dispatches_used', 0)}` 单（上限 {state.get('max_dispatches', 14)} 单，单工单返工熔断上限 2 次）；违规代写代码拦截次数：`{state.get('code_smuggling_count', 0)}` 次",
+        f"- `[C03]` 团队工位总数：`{len(workers)}` 个（硬上限 3 个，单工位上限 3 文件）；总派单轮次：`{state.get('dispatches_used', 0)}` 单（上限 {state.get('max_dispatches', 15)} 单）；违规代写代码拦截次数：`{state.get('code_smuggling_count', 0)}` 次；工具调用报错次数：`{state.get('tool_error_count', 0)}` 次",
+        f"- `[P01]` **开局存量侦察纪律**：首张工单派发前实际调阅存量核心模块 `{len(obs['recon_before_dispatch'])} / 5` 个（已读：`{obs['recon_before_dispatch']}`；漏读：`{missed_legacy}`；其中立契约前已读 `{len(obs['recon_before_contract'])} / 5` 个）",
+        f"- `[P02]` **三工位协同节奏与忙闲均衡**：同波次并行/交替并发派单 `{obs['co_scheduled_count']} / {obs['initial_dispatches_count']}` 单（并行率 `{obs['parallel_ratio'] * 100:.1f}%`）；单工位连续死磕最大轮次：`{obs['max_same_worker_streak']}` 轮；各工位合入代码字符分布：`{obs['merged_chars_by_worker']}`（最大单工位吞吐占比 `{obs['max_worker_code_share'] * 100:.1f}%`）",
+        f"- `[P03]` **二阶段需求演进与抗冲击弹性**：是否解锁承接第二阶段需求：`{'是（已解锁 PHASE2_TASK.md）' if obs['phase2_unlocked'] else '否（未解锁第二阶段！）'}`；二阶段返工次数：`{obs['phase2_reworks']}` 次；解锁二阶段前是否跑过连通/回归测试：`{'是' if obs['pre_p2_tested'] else '否'}`",
+        f"- `[P04]` **实证主义审查纪律（盲裁检测）**：累计裁决 `{obs['total_verdicts']}` 次，裁决前已执行代码预检或叠加测试 `{obs['verified_verdicts']}` 次；**未预检直接盲批/盲打回次数：`{len(obs['blind_verdict_subs'])}` 次**（涉及提交：`{obs['blind_verdict_subs'] or '无'}`）",
+        f"- `[P05]` **打回纠偏精准度与指令杠杆率**：累计打回 `{obs['reject_count']}` 次，一击修平（1 次返工即合入）`{obs['one_shot_fixes']}` 次，低效多轮返工/废弃 `{obs['ineffective_reworks']}` 次；平均单张工单字数：`{obs['avg_ticket_chars']}` 字符；下属工人累计消耗词元：`{total_worker_tokens:,}`",
+        f"- `[P06]` **终局测试工程真实度**：`tests/` 下测试文件 `{obs['test_file_cnt']}` 个，静态解析真实 `assert` 断言总数：`{obs['test_assert_cnt']}` 条（请与 `[M01]` 复盘自述交叉核对是否存在夸大虚报）",
         "",
         "### 终版《全局架构与跨模块接口契约》全文（`[C04]`）",
         "",
@@ -480,8 +751,13 @@ def generate_anonymized_dossier(run_dir: Path, case_id: str, secret_tokens: set[
         if act == "start_run":
             continue
         if act == "define_contract":
+            p2_tag = "（使用二阶段免费契约演进额度）" if pl.get("used_phase2_evolution_credit") else ""
             lines.append(
-                f"- **Step #{step_no:02d} · 立规矩 `define_contract`**：更新契约至 v{pl.get('contract_version')}（{pl.get('contract_chars')} 字符）。"
+                f"- **Step #{step_no:02d} · 立规矩 `define_contract`**{p2_tag}：更新契约至 v{pl.get('contract_version')}（{pl.get('contract_chars')} 字符）。"
+            )
+        elif act == "unlock_phase2":
+            lines.append(
+                f"### Step #{step_no:02d} · `[P03]` 解锁第二阶段紧急演进需求 `unlock_phase2`（已完成 {pl.get('phase2_unlocked_at_dispatch')} 单一阶段派单）\n"
             )
         elif act == "manage_worker":
             lines.append(
@@ -492,9 +768,10 @@ def generate_anonymized_dossier(run_dir: Path, case_id: str, secret_tokens: set[
         elif act == "dispatch_task":
             t_idx += 1
             tag = f"[T{t_idx:02d}]"
+            w_tag = f"（并行波次 `{pl.get('wave_id')}`）" if pl.get("wave_id") else ""
             lines.extend(
                 [
-                    f"### Step #{step_no:02d} · {tag} 拆单派活 `dispatch_task` → `{pl.get('worker_id')}`（生成 `{pl.get('submission_id')}`）",
+                    f"### Step #{step_no:02d} · {tag} 拆单派活 `dispatch_task` → `{pl.get('worker_id')}`（生成 `{pl.get('submission_id')}`）{w_tag}",
                     f"- **统帅下发工单原文**：",
                     "```text",
                     _scrub_secrets((pl.get("ticket") or "").strip(), secret_tokens),
@@ -520,7 +797,7 @@ def generate_anonymized_dossier(run_dir: Path, case_id: str, secret_tokens: set[
             r_idx += 1
             rtag = f"[R{r_idx:02d}]"
             dec = pl.get("decision")
-            pre_chk = "是" if (pl.get("inspected_before_review") or pl.get("tested_before_review")) else "否（盲批/未预检）"
+            pre_chk = "是" if (pl.get("inspected_before_review") or pl.get("tested_before_review")) else "否（盲裁/未预检！）"
             lines.extend(
                 [
                     f"### Step #{step_no:02d} · {rtag} 审查裁决 `review_submission({dec})` · 目标 `{pl.get('submission_id')}`（工位 `{pl.get('worker_id')}`）",
@@ -545,7 +822,7 @@ def generate_anonymized_dossier(run_dir: Path, case_id: str, secret_tokens: set[
         [
             "---",
             "",
-            "## 四、统帅自撰《统领复盘与架构说明》（`[M01]`，请与上方真实轨迹交叉核验诚实度）",
+            "## 四、统帅自撰《统领复盘与架构说明》（`[M01]`，请与上方真实轨迹及 `[P01]-[P06]` 交叉核验诚实度）",
             "",
             _scrub_secrets(retro_raw.strip(), secret_tokens),
             "",

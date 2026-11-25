@@ -38,6 +38,7 @@ OBJECTIVE_SIGNED_FIELDS = (
     "A1",
     "A2",
     "A3",
+    "A4",
     "A_outcome",
     "B1",
     "B2",

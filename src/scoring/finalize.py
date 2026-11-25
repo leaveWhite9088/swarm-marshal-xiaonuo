@@ -151,6 +151,7 @@ def finalize_single_model(
                 "A1": float(cached_obj["A1"]),
                 "A2": float(cached_obj["A2"]),
                 "A3": float(cached_obj["A3"]),
+                "A4": float(cached_obj.get("A4", 0.0)),
                 "B": float(cached_obj["B_efficiency"]),
                 "B1": float(cached_obj["B1"]),
                 "B2": float(cached_obj["B2"]),
@@ -180,13 +181,13 @@ def finalize_single_model(
 
     mean_obj = {
         k: _avg(k)
-        for k in ("total", "objective_70", "A", "A1", "A2", "A3", "B", "B1", "B2", "C", "C1", "C2", "C3", "D", "D1", "D2", "D3", "endToEndMin")
+        for k in ("total", "objective_70", "A", "A1", "A2", "A3", "A4", "B", "B1", "B2", "C", "C1", "C2", "C3", "D", "D1", "D2", "D3", "endToEndMin")
     }
     mean_obj["dispatches_used"] = round(statistics.mean(r["dispatches_used"] for r in run_records), 1)
 
     verdict = {
         "benchmark": "swarm-marshal-xiaonuo",
-        "version": "xiaonuo-v1.0",
+        "version": "xiaonuo-v2.0",
         "model": model_id,
         "updated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "d_aggregate": d_aggregate,
@@ -208,12 +209,12 @@ def finalize_single_model(
     sec_lines = [
         f"### 最终成绩 · {model_id} — 总分均值 **{mean_obj['total']:.2f}** / 100（客观 **{mean_obj['objective_70']:.2f}**/70 + 盲评 **{mean_obj['D']:.2f}**/30）",
         "",
-        "| Run | 总分(100) | A交付(30) | B1经济(5) | B2耗时(10) | C1正交(9) | C2把关(8) | C3拓扑(8) | D1建制(11) | D2拆单(10) | D3审查(9) | 活跃工位 | 派单数 | 耗时(分) | 评委数 |",
+        "| Run | 总分(100) | A交付(25) | B1经济并行(10) | B2耗时(10) | C1侦察演进(8) | C2实证把关(9) | C3协同均衡(8) | D1建制(11) | D2拆单(10) | D3审查(9) | 活跃工位 | 派单数 | 耗时(分) | 评委数 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for r in run_records:
         sec_lines.append(
-            f"| `{r['run']}` | **{r['total']:.2f}** | {r['A']:.2f} ({r['A1']:.1f}/{r['A2']:.1f}/{r['A3']:.1f}) "
+            f"| `{r['run']}` | **{r['total']:.2f}** | {r['A']:.2f} ({r['A1']:.1f}/{r['A2']:.1f}/{r['A3']:.1f}/{r['A4']:.1f}) "
             f"| {r['B1']:.2f} | {r['B2']:.2f} | {r['C1']:.2f} | {r['C2']:.2f} | {r['C3']:.2f} "
             f"| {r['D1']:.2f} | {r['D2']:.2f} | {r['D3']:.2f} | {r['workers_active']} | {r['dispatches_used']} "
             f"| {r['endToEndMin']:.1f} | {r['judge_count']} |"
@@ -235,13 +236,13 @@ def write_leaderboard_markdown(
     board.sort(key=lambda v: (-(v.get("mean", {}).get("total") or 0.0), v.get("model", "")))
 
     lines = [
-        "# 排行榜 · 群智统帅基准（swarm-marshal-xiaonuo · xiaonuo-v1.0）",
+        "# 排行榜 · 群智统帅基准（swarm-marshal-xiaonuo · xiaonuo-v2.0）",
         "",
-        "> 总分 = **A 终局系统集成交付（30）+ B 统领效率与经济性（15，受 A/30 封顶）+ C 组织管控与把关（25）+ D 统帅领导力盲评（30，对照 5 级样本锚定）**。",
+        "> 总分 = **A 终局系统交付（25）+ B 统筹效率与并行杠杆（20，受 A/25 封顶）+ C 五大统领过程管控（25）+ D 双标尺领导力盲评（30）**。",
         "",
         "## 大榜（按各统帅模型多局算术平均总分排名）",
         "",
-        "| 排名 | 统帅模型 | 总分(100) | A交付(30) | B1经济(5) | B2耗时(10) | C1正交(9) | C2把关(8) | C3拓扑(8) | D1建制(11) | D2拆单(10) | D3审查(9) | 平均派单 | 耗时(分) | 已评Run |",
+        "| 排名 | 统帅模型 | 总分(100) | A交付(25) | B1经济并行(10) | B2耗时(10) | C1侦察演进(8) | C2实证把关(9) | C3协同均衡(8) | D1建制(11) | D2拆单(10) | D3审查(9) | 平均派单 | 耗时(分) | 已评Run |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
 

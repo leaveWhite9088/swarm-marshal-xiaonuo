@@ -54,9 +54,10 @@ def score_single_run(
             "A1": 0.0,
             "A2": 0.0,
             "A3": 0.0,
+            "A4": 0.0,
             "A_total": 0.0,
-            "wave_counts": {"w1_passed": 0, "w1_total": 12, "w2_passed": 0, "w2_total": 10, "w3_passed": 0, "w3_total": 8},
-            "waves": {"wave1": [], "wave2": [], "wave3": []},
+            "wave_counts": {"w1_passed": 0, "w1_total": 10, "w2_passed": 0, "w2_total": 10, "w3_passed": 0, "w3_total": 10, "w4_passed": 0, "w4_total": 10},
+            "waves": {"wave1": [], "wave2": [], "wave3": [], "wave4": []},
         }
     else:
         a_rep = workload.evaluate_workspace_waves(rp / "workspace", config.get("scoring") or {})
@@ -78,6 +79,7 @@ def score_single_run(
         "A1": 0.0 if bc_rep["tampered"] else a_rep["A1"],
         "A2": 0.0 if bc_rep["tampered"] else a_rep["A2"],
         "A3": 0.0 if bc_rep["tampered"] else a_rep["A3"],
+        "A4": 0.0 if bc_rep["tampered"] else a_rep.get("A4", 0.0),
         "A_outcome": a_out,
         "B1": bc_rep["B1"],
         "B2": bc_rep["B2"],
